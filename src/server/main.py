@@ -80,21 +80,129 @@ async def send_to_one(writer: asyncio.StreamWriter, message: dict):
         logging.warning(f"Could not send message to client {addr}: {e}")
 
 
+def _find_player_slot():
+    """Находит свободный или отключенный слот для игрока."""
+    for p_id, session in player_sessions.items():
+        if session["status"] == "DISCONNECTED":
+            is_reconnect = session["addr"] is not None
+            return p_id, is_reconnect
+    return None, False
+
+
+async def _handle_new_connection(writer: asyncio.StreamWriter, player_id: int, is_reconnect: bool):
+    """Обрабатывает начальную настройку для нового или переподключившегося клиента."""
+    addr = writer.get_extra_info('peername', '???')
+
+    # Обновляем сессию для подключившегося игрока
+    player_sessions[player_id]["writer"] = writer
+    player_sessions[player_id]["status"] = "CONNECTED"
+    player_sessions[player_id]["addr"] = addr
+    logging.info(f"Client {addr} assigned to player ID {player_id}. Status: CONNECTED/RECONNECTED")
+
+    # Если это было переподключение, уведомляем всех
+    if is_reconnect:
+        await broadcast({"type": "PLAYER_RECONNECTED", "payload": {"player_id": player_id}})
+
+    # --- Сообщаем клиенту его ID ---
+    await send_to_one(writer, {"type": "ASSIGN_PLAYER_ID", "payload": {"player_id": player_id}})
+
+    # --- Отправка полного состояния новому клиенту ---
+    initial_state = serialize_game_state_for_player(player_id)
+    await send_to_one(writer, {"type": "FULL_STATE_UPDATE", "payload": initial_state})
+    logging.info(f"Sent full state snapshot to client {addr}")
+
+
+async def _process_client_message(message_str: str, player_entity_id: int, writer: asyncio.StreamWriter):
+    """Парсит и обрабатывает одно сообщение от клиента, создавая команды в ECS."""
+    addr = writer.get_extra_info('peername', '???')
+    try:
+        command = json.loads(message_str)
+        if not isinstance(command, dict):
+            raise ValueError("Command is not a dictionary.")
+    except (json.JSONDecodeError, ValueError):
+        logging.info(f"Received non-JSON or invalid command from {addr}, treating as chat.")
+        response = {"type": "chat", "from": str(addr), "payload": message_str}
+        await broadcast(response)
+        return
+
+    command_type = command.get("type")
+    payload = command.get("payload", {})
+
+    # --- Централизованная проверка хода ---
+    if command_type in ["PLAY_CARD", "DECLARE_ATTACKERS", "END_TURN", "TAP_LAND"]:
+        active_player_ent = next((ent for ent, _ in esper.get_component(ActiveTurn)), -1)
+        if player_entity_id != active_player_ent:
+            logging.warning(f"[SECURITY] Player {player_entity_id} tried action '{command_type}' during Player {active_player_ent}'s turn. Denied.")
+            await send_to_one(writer, {"type": "ACTION_ERROR", "payload": {"message": "Сейчас не ваш ход."}})
+            return
+
+    # --- Диспетчеризация команд ---
+    if command_type == "PLAY_CARD":
+        card_id = payload.get("card_entity_id")
+        target_id = payload.get("target_id")
+        if card_id is not None:
+            esper.create_entity(PlayCardCommand(player_entity_id=player_entity_id, card_entity_id=card_id, target_id=target_id))
+        else:
+            logging.error(f"Command PLAY_CARD from {addr} is missing 'card_entity_id'.")
+    elif command_type == "END_TURN":
+        esper.create_entity(EndTurnCommand(player_entity_id=player_entity_id))
+    elif command_type == "TAP_LAND":
+        card_id = payload.get("card_entity_id")
+        if card_id is not None:
+            esper.create_entity(TapLandCommand(player_entity_id=player_entity_id, card_entity_id=card_id))
+    elif command_type == "DECLARE_BLOCKERS":
+        blocks = {int(k): v for k, v in payload.get("blocks", {}).items()}
+        esper.create_entity(DeclareBlockersCommand(player_entity_id=player_entity_id, blocks=blocks))
+    elif command_type == "DECLARE_ATTACKERS":
+        attacker_ids = payload.get("attacker_ids", [])
+        esper.create_entity(DeclareAttackersCommand(player_entity_id=player_entity_id, attacker_ids=attacker_ids))
+    elif command_type == "MULLIGAN":
+        esper.create_entity(MulliganCommand(player_entity_id=player_entity_id))
+    elif command_type == "KEEP_HAND":
+        esper.create_entity(KeepHandCommand(player_entity_id=player_entity_id))
+    elif command_type == "PUT_CARDS_BOTTOM":
+        card_ids = payload.get("card_ids", [])
+        if isinstance(card_ids, list):
+            esper.create_entity(PutCardsBottomCommand(player_entity_id=player_entity_id, card_ids=card_ids))
+    else:
+        logging.warning(f"Received unknown command type '{command_type}' from {addr}, treating as chat.")
+        response = {"type": "chat", "from": str(addr), "payload": message_str}
+        await broadcast(response)
+
+
+async def _handle_disconnection(writer: asyncio.StreamWriter):
+    """Обрабатывает отключение клиента, обновляя его статус."""
+    addr = writer.get_extra_info('peername', '???')
+    disconnected_player_id = None
+    for p_id, session in player_sessions.items():
+        if session["writer"] == writer:
+            session["status"] = "DISCONNECTED"
+            session["writer"] = None
+            disconnected_player_id = p_id
+            break
+
+    if disconnected_player_id:
+        logging.info(f"Player {disconnected_player_id} ({addr}) marked as DISCONNECTED.")
+        await broadcast({"type": "PLAYER_DISCONNECTED", "payload": {"player_id": disconnected_player_id}})
+    else:
+        logging.warning(f"A client ({addr}) disconnected, but was not found in active sessions.")
+
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+    except asyncio.TimeoutError:
+        logging.warning(f"Closing connection with {addr} timed out.")
+
+
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Эта корутина выполняется для каждого нового подключения клиента."""
+    """
+    Эта корутина выполняется для каждого нового подключения клиента.
+    Она находит слот для игрока, обрабатывает его сообщения и отключение.
+    """
     addr = writer.get_extra_info('peername', '???')
     logging.info(f"New client trying to connect: {addr}")
 
-    player_entity_id = None
-    is_reconnect = False
-    # Ищем свободный или отключенный слот для игрока
-    for p_id, session in player_sessions.items():
-        if session["status"] == "DISCONNECTED":
-            player_entity_id = p_id
-            # Если у слота уже был адрес, значит это переподключение, а не первая инициализация
-            if session["addr"] is not None:
-                is_reconnect = True
-            break
+    player_entity_id, is_reconnect = _find_player_slot()
 
     if player_entity_id is None:
         logging.warning(f"Connection rejected for {addr}: all slots are full.")
@@ -106,144 +214,19 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             pass
         return
 
-    # Обновляем сессию для подключившегося игрока
-    player_sessions[player_entity_id]["writer"] = writer
-    player_sessions[player_entity_id]["status"] = "CONNECTED"
-    player_sessions[player_entity_id]["addr"] = addr
-    logging.info(f"Client {addr} assigned to player ID {player_entity_id}. Status: CONNECTED/RECONNECTED")
-
-    # Если это было переподключение, уведомляем всех
-    if is_reconnect:
-        await broadcast({"type": "PLAYER_RECONNECTED", "payload": {"player_id": player_entity_id}})
-
-    # --- Сообщаем клиенту его ID ---
-    await send_to_one(writer, {"type": "ASSIGN_PLAYER_ID", "payload": {"player_id": player_entity_id}})
-
-    # --- Отправка полного состояния новому клиенту ---
-    initial_state = serialize_game_state_for_player(player_entity_id)
-    await send_to_one(writer, {"type": "FULL_STATE_UPDATE", "payload": initial_state})
-    logging.info(f"Sent full state snapshot to client {addr}")
+    await _handle_new_connection(writer, player_entity_id, is_reconnect)
 
     try:
         while True:
             data = await reader.readline()
-            if not data:
-                # Соединение разорвано клиентом
-                break
-
+            if not data: break
             message_str = data.decode().strip()
             logging.debug(f"Received from {addr}: {message_str}")
-
-            try:
-                command = json.loads(message_str)
-                if isinstance(command, dict):
-                    command_type = command.get("type")
-
-                    # --- Централизованная проверка хода ---
-                    # Проверяем действия, которые можно выполнять только в свой ход.
-                    # Это быстрая проверка, чтобы немедленно отклонить неверные команды.
-                    # Основная проверка все равно остается в системах.
-                    if command_type in ["PLAY_CARD", "DECLARE_ATTACKERS", "END_TURN", "TAP_LAND"]:
-                        # Находим, чей сейчас ход, прямо из мира esper
-                        active_player_ent = next((ent for ent, _ in esper.get_component(ActiveTurn)), -1)
-
-                        # Если команду отправил неактивный игрок, отправляем ошибку и игнорируем команду.
-                        if player_entity_id != active_player_ent:
-                            logging.warning(f"[SECURITY] Player {player_entity_id} tried action '{command_type}' during Player {active_player_ent}'s turn. Denied.")
-                            await send_to_one(writer, {"type": "ACTION_ERROR", "payload": {"message": "Сейчас не ваш ход."}})
-                            continue # Переходим к следующему сообщению от клиента
-
-                    if command_type == "PLAY_CARD":
-                        payload = command.get("payload", {})
-                        card_id = payload.get("card_entity_id")
-                        target_id = payload.get("target_id") # Get optional target
-                        if card_id is not None:
-                            esper.create_entity(PlayCardCommand(
-                                player_entity_id=player_entity_id,
-                                card_entity_id=card_id,
-                                target_id=target_id # Pass it to the command
-                            ))
-                        else:
-                            logging.error(f"Command PLAY_CARD from {addr} is missing 'card_entity_id'.")
-                    elif command_type == "END_TURN":
-                        esper.create_entity(EndTurnCommand(
-                            player_entity_id=player_entity_id
-                        ))
-                    elif command_type == "TAP_LAND":
-                        payload = command.get("payload", {})
-                        card_id = payload.get("card_entity_id")
-                        if card_id is not None:
-                            esper.create_entity(TapLandCommand(
-                                player_entity_id=player_entity_id,
-                                card_entity_id=card_id
-                            ))
-                    elif command_type == "DECLARE_BLOCKERS":
-                        payload = command.get("payload", {})
-                        blocks = payload.get("blocks", {})
-                        # Преобразуем ключи из строк обратно в int
-                        int_blocks = {int(k): v for k, v in blocks.items()}
-                        esper.create_entity(DeclareBlockersCommand(
-                            player_entity_id=player_entity_id, blocks=int_blocks))
-                    elif command_type == "DECLARE_ATTACKERS":
-                        payload = command.get("payload", {})
-                        attacker_ids = payload.get("attacker_ids", [])
-                        esper.create_entity(DeclareAttackersCommand(
-                            player_entity_id=player_entity_id,
-                            attacker_ids=attacker_ids
-                        ))
-                    # --- Новые команды для муллигана ---
-                    elif command_type == "MULLIGAN":
-                        esper.create_entity(MulliganCommand(player_entity_id=player_entity_id))
-                    elif command_type == "KEEP_HAND":
-                        esper.create_entity(KeepHandCommand(player_entity_id=player_entity_id))
-                    elif command_type == "PUT_CARDS_BOTTOM":
-                        payload = command.get("payload", {})
-                        card_ids = payload.get("card_ids", [])
-                        # Простая валидация на клиенте
-                        if isinstance(card_ids, list):
-                            esper.create_entity(PutCardsBottomCommand(
-                                player_entity_id=player_entity_id,
-                                card_ids=card_ids
-                            ))
-                    else: # Command is not a known game action
-                        # Для других сообщений (или некорректных JSON-команд) работаем как чат
-                        response = {"type": "chat", "from": str(addr), "payload": message_str}
-                        await broadcast(response)
-                else:
-                    # Для других сообщений (или некорректных JSON-команд) работаем как чат
-                    response = {"type": "chat", "from": str(addr), "payload": message_str}
-                    await broadcast(response)
-            except json.JSONDecodeError:
-                # Если это вообще не JSON, тоже отправляем в чат
-                logging.info(f"Received non-JSON data from {addr}, treating as chat.")
-                response = {"type": "chat", "from": str(addr), "payload": message_str}
-                await broadcast(response)
-
+            await _process_client_message(message_str, player_entity_id, writer)
     except asyncio.CancelledError:
-        pass
+        logging.info(f"Client handler for {addr} cancelled.")
     finally:
-        # Используем addr, полученный в начале, на случай если сокет уже закрыт
-        logging.info(f"Client {addr} disconnected.")
-        # Вместо удаления, помечаем игрока как отключенного
-        disconnected_player_id = None
-        for p_id, session in player_sessions.items():
-            if session["writer"] == writer:
-                session["status"] = "DISCONNECTED"
-                session["writer"] = None
-                disconnected_player_id = p_id
-                break
-
-        if disconnected_player_id:
-            logging.info(f"Player {disconnected_player_id} marked as DISCONNECTED.")
-            # Уведомляем оставшегося игрока
-            await broadcast({"type": "PLAYER_DISCONNECTED", "payload": {"player_id": disconnected_player_id}})
-
-        writer.close()
-        try:
-            # Закрытие сокета тоже может занять время, защищаемся таймаутом
-            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
-        except asyncio.TimeoutError:
-            logging.warning(f"Closing connection with {addr} timed out.")
+        await _handle_disconnection(writer)
 
 
 # --- Игровой цикл ---

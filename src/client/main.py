@@ -138,69 +138,72 @@ class CardSprite(pygame.sprite.Sprite):
         self.rect = self.image.get_rect()
         self.update_visuals() # Initial draw with no highlights
 
+    def _draw_card_back(self):
+        """Рисует рубашку карты."""
+        self.image.fill((139, 69, 19))  # SaddleBrown
+        pygame.draw.rect(self.image, (0, 0, 0), self.image.get_rect(), 5)
+        pygame.draw.circle(self.image, (218, 165, 32), self.image.get_rect().center, 30)  # Goldenrod
+
+    def _draw_card_face(self):
+        """Рисует лицевую сторону карты: фон, имя, стоимость и характеристики."""
+        self.image.fill(CARD_BG_COLOR)
+        pygame.draw.rect(self.image, (0, 0, 0), self.image.get_rect(), 2)
+
+        name = self.card_data.get('name', '???')
+        cost = self.card_data.get('cost', '?')
+        card_type = self.card_data.get('type')
+
+        name_text = self.font.render(name, True, FONT_COLOR)
+        cost_text = self.font.render(f"({cost})", True, FONT_COLOR)
+        self.image.blit(name_text, (5, 5))
+        self.image.blit(cost_text, (CARD_WIDTH - cost_text.get_width() - 5, 5))
+
+        if card_type == 'MINION':
+            attack = self.card_data.get('attack', '?')
+            health = self.card_data.get('health', '?')
+            stats_text = self.font.render(f"{attack}/{health}", True, FONT_COLOR)
+            self.image.blit(stats_text, (CARD_WIDTH - stats_text.get_width() - 5, CARD_HEIGHT - 25))
+        elif card_type == 'SPELL':
+            type_text = self.font.render("Spell", True, FONT_COLOR)
+            self.image.blit(type_text, (5, CARD_HEIGHT - 25))
+
+    def _draw_status_overlays(self):
+        """Рисует оверлеи и индикаторы статусов (болезнь вызова, поворот)."""
+        if self.card_data.get('has_sickness'):
+            sickness_overlay = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+            sickness_overlay.fill((128, 128, 128, 100))  # Полупрозрачный серый
+            self.image.blit(sickness_overlay, (0, 0))
+            zzz_text = self.font.render("Zzz", True, (200, 200, 255))
+            self.image.blit(zzz_text, (5, CARD_HEIGHT - 45))
+
+        if self.card_data.get('is_tapped'):
+            tapped_overlay = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+            tapped_overlay.fill((0, 0, 0, 100))  # Полупрозрачный черный
+            self.image.blit(tapped_overlay, (0, 0))
+
+        if self.card_data.get('can_attack', False):
+            pygame.draw.circle(self.image, ATTACK_READY_COLOR, (15, CARD_HEIGHT - 15), 10)
+
+    def _draw_interaction_borders(self, is_hovered: bool, is_selected: bool):
+        """Рисует рамки в зависимости от взаимодействия (атака, выбор, наведение)."""
+        if self.card_data.get('is_attacking'):
+            pygame.draw.rect(self.image, (255, 60, 60), self.image.get_rect(), 5)
+        if is_selected:
+            selection_color = PUT_BOTTOM_COLOR if self.card_data.get('is_pending_put_bottom', False) else CARD_SELECTION_COLOR
+            pygame.draw.rect(self.image, selection_color, self.image.get_rect(), 5)
+        if is_hovered:
+            pygame.draw.rect(self.image, CARD_HIGHLIGHT_COLOR, self.image.get_rect(), 4)
+
     def update_visuals(self, is_hovered: bool = False, is_selected: bool = False):
         """Перерисовывает внешний вид карты на основе ее данных."""
         if self.card_data.get('is_hidden', False):
-            # --- Рисуем рубашку карты ---
-            self.image.fill((139, 69, 19)) # SaddleBrown
-            pygame.draw.rect(self.image, (0, 0, 0), self.image.get_rect(), 5)
-            pygame.draw.circle(self.image, (218, 165, 32), self.image.get_rect().center, 30) # Goldenrod
+            self._draw_card_back()
         else:
-            # --- Рисуем лицевую сторону карты ---
-            self.image.fill(CARD_BG_COLOR)
-            # Добавляем базовую рамку для визуального разделения карт при наложении
-            pygame.draw.rect(self.image, (0, 0, 0), self.image.get_rect(), 2)
+            self._draw_card_face()
+            self._draw_status_overlays()
 
-            name = self.card_data.get('name', '???')
-            cost = self.card_data.get('cost', '?')
-            card_type = self.card_data.get('type')
-
-            name_text = self.font.render(name, True, FONT_COLOR)
-            cost_text = self.font.render(f"({cost})", True, FONT_COLOR)
-            self.image.blit(name_text, (5, 5))
-            self.image.blit(cost_text, (CARD_WIDTH - cost_text.get_width() - 5, 5))
-
-            if card_type == 'MINION':
-                attack = self.card_data.get('attack', '?')
-                health = self.card_data.get('health', '?')
-                stats_text = self.font.render(f"{attack}/{health}", True, FONT_COLOR)
-                self.image.blit(stats_text, (CARD_WIDTH - stats_text.get_width() - 5, CARD_HEIGHT - 25))
-            elif card_type == 'SPELL':
-                type_text = self.font.render("Spell", True, FONT_COLOR)
-                self.image.blit(type_text, (5, CARD_HEIGHT - 25))
-
-            if self.card_data.get('has_sickness'):
-                sickness_overlay = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
-                sickness_overlay.fill((128, 128, 128, 100))  # Полупрозрачный серый
-                self.image.blit(sickness_overlay, (0, 0))
-                zzz_text = self.font.render("Zzz", True, (200, 200, 255))
-                self.image.blit(zzz_text, (5, CARD_HEIGHT - 45))
-
-            if self.card_data.get('is_tapped'):
-                tapped_overlay = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
-                tapped_overlay.fill((0, 0, 0, 100))  # Полупрозрачный черный
-                self.image.blit(tapped_overlay, (0, 0))
-
-            if self.card_data.get('can_attack', False):
-                pygame.draw.circle(self.image, ATTACK_READY_COLOR, (15, CARD_HEIGHT - 15), 10)
-
-        # --- Отрисовка рамок поверх всего ---
-        # Красная рамка для подтвержденных атакующих (высший приоритет)
-        if self.card_data.get('is_attacking'):
-            pygame.draw.rect(self.image, (255, 60, 60), self.image.get_rect(), 5)
-
-        # Синяя рамка для выбранных карт (атака, блок, цель заклинания)
-        if is_selected:
-            # Определяем цвет рамки в зависимости от контекста
-            selection_color = CARD_SELECTION_COLOR
-            # Если мы в фазе муллигана и карта выбрана для отправки вниз, используем другой цвет
-            if self.card_data.get('is_pending_put_bottom', False):
-                selection_color = PUT_BOTTOM_COLOR
-            pygame.draw.rect(self.image, selection_color, self.image.get_rect(), 5)
-
-        # Желтая рамка для наведения (рисуется поверх синей, если оба состояния активны)
-        if is_hovered:
-            pygame.draw.rect(self.image, CARD_HIGHLIGHT_COLOR, self.image.get_rect(), 4)
+        # Рамки рисуются поверх всего остального
+        self._draw_interaction_borders(is_hovered, is_selected)
 
 # --- Системы (Systems) ---
 
