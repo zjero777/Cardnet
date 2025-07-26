@@ -1,5 +1,6 @@
 import asyncio
 import json
+import argparse
 import sys
 import threading
 import queue
@@ -1104,7 +1105,7 @@ class NetworkThread(threading.Thread):
 
 # --- Основной класс клиента (Main Client Class) ---
 class PygameClient:
-    def __init__(self):
+    def __init__(self, host: str, port: int):
         pygame.init()
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         pygame.display.set_caption("Cardnet ECS Client")
@@ -1127,7 +1128,7 @@ class PygameClient:
         self.running = True
         self.incoming_queue = queue.Queue()
         self.outgoing_queue = queue.Queue()
-        self.network_thread = NetworkThread(self.incoming_queue, self.outgoing_queue, '127.0.0.1', 8888)
+        self.network_thread = NetworkThread(self.incoming_queue, self.outgoing_queue, host, port)
 
     def run(self):
         # Instantiate systems that might depend on each other
@@ -1166,5 +1167,12 @@ class PygameClient:
         sys.exit()
 
 if __name__ == "__main__":
-    client = PygameClient()
+    parser = argparse.ArgumentParser(description="Cardnet: клиент для сетевой карточной игры.")
+    parser.add_argument('--host', type=str, default='127.0.0.1',
+                        help='IP-адрес сервера для подключения (по умолчанию: 127.0.0.1)')
+    parser.add_argument('--port', type=int, default=8888,
+                        help='Порт сервера для подключения (по умолчанию: 8888)')
+    args = parser.parse_args()
+
+    client = PygameClient(host=args.host, port=args.port)
     client.run()
