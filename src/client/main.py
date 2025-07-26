@@ -66,6 +66,7 @@ class ClientState:
     my_player_id: Optional[int] = None
     active_player_id: Optional[int] = None
     game_state_dict: Dict[str, Any] = None  # Raw state from server
+    network_status: str = "CONNECTING" # CONNECTING, CONNECTED, FAILED, DISCONNECTED
     selected_entity: Optional[int] = None
     hovered_entity: Optional[int] = None
     game_over: bool = False
@@ -216,11 +217,16 @@ class StateUpdateSystem(esper.Processor):
 
                 if event_type == "ASSIGN_PLAYER_ID":
                     self.client_state.my_player_id = event["payload"]["player_id"]
-                
+
+                elif event_type == "CONNECTION_SUCCESS":
+                    self.client_state.network_status = "CONNECTED"
+
                 elif event_type == "FULL_STATE_UPDATE":
                     game_state_dict = event.get("payload", {})
                     self.client_state.game_state_dict = game_state_dict
                     self.client_state.active_player_id = game_state_dict.get("active_player_id")
+                    # If we get a state update, we must be connected.
+                    self.client_state.network_status = "CONNECTED"
                     # Полное обновление состояния синхронизирует мир, но не должно менять текущую фазу хода.
                     # Фаза меняется только специальными событиями (TURN_STARTED, COMBAT_RESOLVED и т.д.),
                     # поэтому мы не сбрасываем self.client_state.phase здесь.
@@ -246,10 +252,13 @@ class StateUpdateSystem(esper.Processor):
                     self.client_state.game_over = True
                     self.client_state.winner_id = payload.get("winner_id")
 
-                elif event_type in ["CONNECTION_FAILED", "DISCONNECTED"]:
-                    print(f"Network status: {event_type}")
-                    # A more robust implementation would set a flag to exit the game loop
-                    # For now, we assume the main loop will handle this.
+                elif event_type == "CONNECTION_FAILED":
+                    reason = event.get("payload", {}).get("reason", "Unknown error")
+                    print(f"Network status: CONNECTION_FAILED. Reason: {reason}")
+                    self.client_state.network_status = "FAILED"
+                elif event_type == "DISCONNECTED":
+                    print(f"Network status: DISCONNECTED")
+                    self.client_state.network_status = "DISCONNECTED"
                 elif event_type == "PLAYER_DISCONNECTED":
                     player_id = event['payload']['player_id']
                     self.client_state.player_connection_status[player_id] = "DISCONNECTED"
@@ -640,6 +649,13 @@ class InputSystem(esper.Processor):
                 client_state.my_player_id = -999 # Сигнал для выхода из главного цикла
                 return
 
+            # Если соединение не удалось или разорвано, ждем любого ввода для выхода
+            if client_state.network_status in ["FAILED", "DISCONNECTED"]:
+                if event.type in [pygame.QUIT, pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN]:
+                    self.outgoing_q.put(None)
+                    client_state.my_player_id = -999 # Сигнал для выхода
+                continue # Не обрабатываем другие события
+
             # Если игра окончена, игнорируем все остальные события ввода
             if client_state.game_over:
                 continue
@@ -822,7 +838,14 @@ class RenderSystem(esper.Processor):
         client_state = self.client_state
         self.screen.fill(BG_COLOR)
 
-        if client_state.game_over:
+        if client_state.network_status == "CONNECTING":
+            self._draw_message_screen("Подключение к серверу...", (200, 200, 200))
+        elif client_state.network_status in ["FAILED", "DISCONNECTED"]:
+            reason = "Не удалось подключиться к серверу."
+            if client_state.network_status == "DISCONNECTED":
+                reason = "Соединение с сервером потеряно."
+            self._draw_message_screen(f"{reason}\nНажмите любую клавишу для выхода.", (255, 100, 100))
+        elif client_state.game_over:
             self._draw_game_over_screen(client_state)
         else:
             hovered_card_to_draw = None
@@ -932,6 +955,19 @@ class RenderSystem(esper.Processor):
         text_surf = self.big_font.render(text, True, color)
         text_rect = text_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
         self.screen.blit(text_surf, text_rect)
+
+    def _draw_message_screen(self, text: str, color: tuple):
+        """Вспомогательная функция для отрисовки центрированного сообщения на экране."""
+        lines = text.split('\n')
+        total_height = len(lines) * self.medium_font.get_height()
+        start_y = (SCREEN_HEIGHT - total_height) // 2
+
+        for i, line in enumerate(lines):
+            text_surf = self.medium_font.render(line, True, color)
+            text_rect = text_surf.get_rect(
+                centerx=SCREEN_WIDTH // 2, 
+                y=start_y + i * self.medium_font.get_height())
+            self.screen.blit(text_surf, text_rect)
 
     def _draw_animation(self, animation_event: Dict[str, Any]):
         """Draws a visual effect for the current animation event."""
@@ -1070,13 +1106,17 @@ class NetworkThread(threading.Thread):
 
     async def main_async(self):
         try:
-            reader, writer = await asyncio.open_connection(self.host, self.port)
+            # Добавляем таймаут для попытки подключения
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port),
+                timeout=5.0
+            )
             self.incoming_q.put({"type": "CONNECTION_SUCCESS"})
             read_task = self.loop.create_task(self.read_from_server(reader))
             write_task = self.loop.create_task(self.write_to_server(writer))
             await asyncio.wait([read_task, write_task], return_when=asyncio.FIRST_COMPLETED)
-        except ConnectionRefusedError:
-            self.incoming_q.put({"type": "CONNECTION_FAILED"})
+        except (ConnectionRefusedError, TimeoutError, OSError) as e:
+            self.incoming_q.put({"type": "CONNECTION_FAILED", "payload": {"reason": str(e)}})
         finally:
             if self.loop.is_running():
                 self.loop.stop()

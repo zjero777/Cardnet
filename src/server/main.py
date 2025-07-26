@@ -391,7 +391,7 @@ async def main():
     setup_new_game()
 
     # --- Запуск сервера и игрового цикла ---
-    server = await asyncio.start_server(handle_client, '127.0.0.1', 8888)
+    server = await asyncio.start_server(handle_client, '0.0.0.0', 8888)
 
     addr = server.sockets[0].getsockname()
     logging.info(f'Server listening on {addr}')
