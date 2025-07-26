@@ -64,6 +64,43 @@ class Tapped:
 class SummoningSickness:
     pass
 
+# --- Mulligan Phase Components & Commands ---
+@dataclass
+class MulliganCommand:
+    """Команда для выполнения муллигана."""
+    player_entity_id: int
+
+@dataclass
+class KeepHandCommand:
+    """Команда для сохранения текущей руки."""
+    player_entity_id: int
+
+@dataclass
+class PutCardsBottomCommand:
+    """Команда для отправки выбранных карт в низ колоды после муллигана."""
+    player_entity_id: int
+    card_ids: list[int]
+
+@dataclass
+class MulliganDecisionPhase:
+    """Маркер для игрока, который решает, оставить руку или сделать муллиган."""
+    pass
+
+@dataclass
+class KeptHand:
+    """Маркер для игрока, который решил оставить руку."""
+    pass
+
+@dataclass
+class MulliganCount:
+    """Отслеживает, сколько раз игрок сделал муллиган."""
+    count: int = 0
+
+@dataclass
+class GamePhaseComponent:
+    """Синглтон-компонент для отслеживания общей фазы игры на сервере."""
+    phase: str # "MULLIGAN", "GAME_RUNNING"
+
 @dataclass
 class Attacking:
     pass

@@ -1,3 +1,23 @@
+"""
+Сервер для многопользовательской карточной игры Cardnet.
+
+--- РЕАЛИЗОВАНО ---
+- Асинхронный TCP-сервер на asyncio.
+- Поддержка двух игроков с переподключением.
+- Игровая логика на базе ECS (esper).
+- Базовые системы: розыгрыш карт, смена хода, атака, конец игры.
+- Правило "муллигана" (сброс стартовой руки) по правилам MTG.
+- Создание колод, стартовая рука, базовые типы карт (существа, земли, заклинания).
+- Сериализация и отправка состояния игры клиентам.
+- Обработка команд от клиентов.
+
+--- ПЛАН РАЗРАБОТКИ (TODO) ---
+- Более сложные механики карт (триггеры, пассивные способности).
+- Расширенная система фаз (Upkeep, End Step).
+- Загрузка колод из файлов.
+- Лобби и система подбора игроков.
+- Улучшенная валидация действий игроков на сервере.
+"""
 import asyncio
 import json
 import logging
@@ -7,10 +27,12 @@ import time
 import esper
 from src.common.components import (
     CardInfo, Player, Owner, InHand, OnBoard, PlayCardCommand, GameOver, SpellEffect, ActiveTurn, Graveyard,
-    InGraveyard, EndTurnCommand, Deck, InDeck, Tapped, TapLandCommand, DeclareBlockersCommand,
-    DeclareAttackersCommand, Attacking, SummoningSickness
+    InGraveyard, EndTurnCommand, Deck, InDeck, Tapped, TapLandCommand, DeclareAttackersCommand,
+    Attacking, SummoningSickness, DeclareBlockersCommand,
+    MulliganCommand, KeepHandCommand, PutCardsBottomCommand, MulliganDecisionPhase, MulliganCount, GamePhaseComponent, KeptHand
 )
-from src.server.systems import PlayCardSystem, TurnManagementSystem, AttackSystem, GameOverSystem, TapLandSystem
+from src.server.systems import (PlayCardSystem, TurnManagementSystem, AttackSystem, GameOverSystem, TapLandSystem,
+                                MulliganSystem)
 
 # --- Глобальное состояние ---
 # Глобальное состояние для сессий игроков. Позволяет обрабатывать переподключения.
@@ -169,6 +191,20 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             player_entity_id=player_entity_id,
                             attacker_ids=attacker_ids
                         ))
+                    # --- Новые команды для муллигана ---
+                    elif command_type == "MULLIGAN":
+                        esper.create_entity(MulliganCommand(player_entity_id=player_entity_id))
+                    elif command_type == "KEEP_HAND":
+                        esper.create_entity(KeepHandCommand(player_entity_id=player_entity_id))
+                    elif command_type == "PUT_CARDS_BOTTOM":
+                        payload = command.get("payload", {})
+                        card_ids = payload.get("card_ids", [])
+                        # Простая валидация на клиенте
+                        if isinstance(card_ids, list):
+                            esper.create_entity(PutCardsBottomCommand(
+                                player_entity_id=player_entity_id,
+                                card_ids=card_ids
+                            ))
                     else: # Command is not a known game action
                         # Для других сообщений (или некорректных JSON-команд) работаем как чат
                         response = {"type": "chat", "from": str(addr), "payload": message_str}
@@ -317,14 +353,13 @@ def setup_new_game():
                 # полное состояние игры при подключении. Это позволяет избежать
                 # отправки множества отдельных событий при запуске.
     logging.info("Dealt starting hands (7 cards) to both players.")
-
-    # --- Начало первого хода ---
-    # Игрок 1 начинает. В MTG первый игрок пропускает взятие карты на первом ходу.
-    # Наша TurnManagementSystem обрабатывает взятие карты в НАЧАЛЕ хода следующего игрока,
-    # когда текущий игрок завершает свой ход. Таким образом, эта логика работает "из коробки".
-    starting_player = player1_entity
-    esper.add_component(starting_player, ActiveTurn())
-    logging.info(f"Player {starting_player} starts the game.")
+    
+    # --- NEW: Start Mulligan Phase ---
+    esper.create_entity(GamePhaseComponent(phase="MULLIGAN"))
+    for p_ent in [player1_entity, player2_entity]:
+        esper.add_component(p_ent, MulliganDecisionPhase())
+        esper.add_component(p_ent, MulliganCount(count=0))
+    logging.info("--- Starting Mulligan Phase ---")
 
 def create_deck_for_player(player_entity_id: int) -> list[int]:
     """Создает набор карт для игрока и возвращает их ID."""
@@ -386,6 +421,8 @@ async def main():
     esper.add_processor(tap_land_system)
     esper.add_processor(attack_system)
     esper.add_processor(turn_management_system)
+    # Добавляем систему муллигана
+    esper.add_processor(MulliganSystem(event_queue=event_queue))
 
     # Первоначальная настройка игры
     setup_new_game()
@@ -467,6 +504,10 @@ def _get_active_player_id() -> int | None:
 def _serialize_players_and_distribute_cards(all_cards: dict) -> dict:
     """Инициализирует данные игроков и распределяет карты по рукам и столам."""
     players_data = {}
+    # Get the game phase once, outside the loop for efficiency
+    game_phase_tuple = next(iter(esper.get_component(GamePhaseComponent)), None)
+    game_phase = game_phase_tuple[1].phase if game_phase_tuple else "UNKNOWN"
+
     for player_ent, player in esper.get_component(Player):
         player_id_str = str(player.player_id)
         players_data[player_id_str] = {
@@ -478,13 +519,22 @@ def _serialize_players_and_distribute_cards(all_cards: dict) -> dict:
             "deck_size": len(esper.component_for_entity(player_ent, Deck).card_ids) if esper.has_component(player_ent, Deck) else 0,
             "graveyard_size": len(esper.component_for_entity(player_ent, Graveyard).card_ids) if esper.has_component(player_ent, Graveyard) else 0
         }
+        # NEW: Add mulligan state info
+        if game_phase == "MULLIGAN":
+            if esper.has_component(player_ent, KeptHand):
+                players_data[player_id_str]["mulligan_state"] = "WAITING"
+            elif esper.has_component(player_ent, MulliganDecisionPhase):
+                players_data[player_id_str]["mulligan_state"] = "DECIDING"
+            else: # Must be in PUT_BOTTOM state
+                mulligan_counter = esper.component_for_entity(player_ent, MulliganCount)
+                players_data[player_id_str]["mulligan_state"] = "PUT_BOTTOM"
+                players_data[player_id_str]["mulligan_put_bottom_count"] = mulligan_counter.count
     return players_data
 
 def serialize_game_state_for_player(viewing_player_id: int) -> dict[str, Any]:
     """Собирает все данные из ECS мира в структурированный словарь для отправки клиенту,
     скрывая информацию, которую игрок не должен видеть (например, карты в руке оппонента).
     Эта функция-оркестратор вызывает вспомогательные функции для каждого шага."""
-    
     all_cards = {
         card_ent: _serialize_card(card_ent, card_info, owner, viewing_player_id)
         for card_ent, (card_info, owner) in esper.get_components(CardInfo, Owner)
@@ -492,10 +542,17 @@ def serialize_game_state_for_player(viewing_player_id: int) -> dict[str, Any]:
 
     players_data = _serialize_players_and_distribute_cards(all_cards)
 
+    # --- Add overall game phase ---
+    game_phase = "UNKNOWN"
+    game_phase_tuple = next(iter(esper.get_component(GamePhaseComponent)), None)
+    if game_phase_tuple:
+        game_phase = game_phase_tuple[1].phase
+
     state = {
         "players": players_data,
         "cards": all_cards,
-        "active_player_id": _get_active_player_id()
+        "active_player_id": _get_active_player_id(),
+        "game_phase": game_phase
     }
     return state
 

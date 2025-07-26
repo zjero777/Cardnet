@@ -1,10 +1,13 @@
 import esper
 import time
+import random
 from src.common.components import (
     PlayCardCommand, Player, CardInfo, InHand, OnBoard, Owner, ActiveTurn, EndTurnCommand,
     Deck, InDeck, GameOver, SpellEffect, Tapped, TapLandCommand, PlayedLandThisTurn, SummoningSickness,
     Attacking, WaitingForBlockers, DeclareBlockersCommand, DeclareAttackersCommand,
-    Graveyard, InGraveyard
+    Graveyard, InGraveyard, KeptHand,
+    MulliganCommand, KeepHandCommand, PutCardsBottomCommand, MulliganDecisionPhase,
+    MulliganCount, GamePhaseComponent
 )
 
 def _move_to_graveyard(card_ent, event_queue):
@@ -508,3 +511,97 @@ class TapLandSystem(esper.Processor):
                 self._send_error(player_ent, "Ошибка: сущность или компонент не найден.")
             finally:
                 esper.delete_entity(cmd_ent, immediate=True)
+
+
+class MulliganSystem(esper.Processor):
+    """Обрабатывает фазу муллигана в начале игры."""
+
+    def __init__(self, event_queue):
+        super().__init__()
+        self.event_queue = event_queue
+
+    def _start_game(self):
+        """Начинает основную игру после завершения фазы муллигана."""
+        for ent, phase_comp in esper.get_component(GamePhaseComponent):
+            phase_comp.phase = "GAME_RUNNING"
+            break
+
+        # Игрок 1 начинает
+        starting_player_ent = 1
+        esper.add_component(starting_player_ent, ActiveTurn())
+        self.event_queue.append({"type": "TURN_STARTED", "payload": {"player_id": starting_player_ent}})
+        print("--- Mulligan phase complete. Starting game. ---")
+
+    def process(self):
+        # Система активна только в фазе MULLIGAN
+        # Since GamePhaseComponent is a singleton, we can get it directly.
+        game_phase_components = esper.get_component(GamePhaseComponent)
+        if not game_phase_components or game_phase_components[0][1].phase != "MULLIGAN":
+            return
+
+        # --- Обработка команды "Mulligan" ---
+        for cmd_ent, command in list(esper.get_component(MulliganCommand)):
+            player_ent = command.player_entity_id
+            if not esper.has_component(player_ent, MulliganDecisionPhase):
+                continue
+
+            mulligan_counter = esper.component_for_entity(player_ent, MulliganCount)
+            mulligan_counter.count += 1
+            print(f"Player {player_ent} mulligans for the {mulligan_counter.count} time.")
+
+            # Возвращаем руку в колоду и перемешиваем
+            hand_cards = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == player_ent]
+            deck = esper.component_for_entity(player_ent, Deck)
+            for card_ent in hand_cards:
+                esper.remove_component(card_ent, InHand)
+                esper.add_component(card_ent, InDeck())
+                deck.card_ids.append(card_ent)
+            random.shuffle(deck.card_ids)
+
+            # Берем 7 новых карт
+            for _ in range(7):
+                if deck.card_ids:
+                    card_to_draw = deck.card_ids.pop(0)
+                    esper.remove_component(card_to_draw, InDeck)
+                    esper.add_component(card_to_draw, InHand())
+
+            # Переходим к фазе выбора карт для низа колоды
+            esper.remove_component(player_ent, MulliganDecisionPhase)
+            # Отправляем событие, чтобы главный цикл разослал обновление состояния
+            self.event_queue.append({"type": "MULLIGAN_STATE_CHANGED"})
+            esper.delete_entity(cmd_ent, immediate=True)
+
+        # --- Обработка команды "Put Cards Bottom" ---
+        for cmd_ent, command in list(esper.get_component(PutCardsBottomCommand)):
+            player_ent = command.player_entity_id
+            mulligan_counter = esper.component_for_entity(player_ent, MulliganCount)
+
+            if len(command.card_ids) != mulligan_counter.count:
+                continue # Неверное количество карт
+
+            deck = esper.component_for_entity(player_ent, Deck)
+            for card_ent in command.card_ids:
+                if esper.has_component(card_ent, InHand) and esper.component_for_entity(card_ent, Owner).player_entity_id == player_ent:
+                    esper.remove_component(card_ent, InHand)
+                    esper.add_component(card_ent, InDeck())
+                    deck.card_ids.append(card_ent) # Добавляем в конец (низ) колоды
+
+            # Возвращаемся к фазе решения
+            esper.add_component(player_ent, MulliganDecisionPhase())
+            self.event_queue.append({"type": "MULLIGAN_STATE_CHANGED"})
+            esper.delete_entity(cmd_ent, immediate=True)
+
+        # --- Обработка команды "Keep Hand" ---
+        for cmd_ent, command in list(esper.get_component(KeepHandCommand)):
+            player_ent = command.player_entity_id
+            if esper.has_component(player_ent, MulliganDecisionPhase):
+                print(f"Player {player_ent} keeps their hand.")
+                esper.remove_component(player_ent, MulliganDecisionPhase)
+                esper.add_component(player_ent, KeptHand())
+            self.event_queue.append({"type": "MULLIGAN_STATE_CHANGED"})
+            esper.delete_entity(cmd_ent, immediate=True)
+
+        # --- Проверка на начало игры ---
+        # Игра начинается, когда оба игрока подтвердили свою руку (имеют компонент KeptHand)
+        if len(esper.get_component(KeptHand)) == len(esper.get_component(Player)):
+            self._start_game()

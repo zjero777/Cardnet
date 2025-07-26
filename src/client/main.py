@@ -1,3 +1,25 @@
+"""
+Клиент для многопользовательской карточной игры Cardnet.
+
+--- РЕАЛИЗОВАНО ---
+- Графический интерфейс на Pygame.
+- Асинхронное сетевое взаимодействие в отдельном потоке.
+- Отображение игрового поля, карт в руке и на столе.
+- ECS (esper) для управления состоянием на клиенте.
+- Обработка базовых действий игрока (клик по карте, кнопкам).
+- Система фаз хода (Главная 1, Атака, Блок, Главная 2).
+- Базовые анимации (урон, уничтожение карты).
+- UI-менеджер для кнопок и текстовых меток.
+- Отображение статуса подключения и лога событий.
+
+--- ПЛАН РАЗРАБОТКИ (TODO) ---
+- Главное меню, настройки, выход из игры.
+- Экран лобби для ожидания оппонента.
+- Интерфейс для составления колод (Deck Builder).
+- Улучшенные визуальные эффекты и анимации.
+- Звуковые эффекты и музыкальное сопровождение.
+- Улучшенный UX: подсказки для карт, более наглядная обратная связь.
+"""
 import asyncio
 import json
 import argparse
@@ -40,11 +62,12 @@ PLAYER_BOARD_Y = PLAYER_HAND_Y - CARD_HEIGHT - Y_MARGIN
 OPPONENT_HAND_Y = Y_MARGIN
 OPPONENT_BOARD_Y = OPPONENT_HAND_Y + CARD_HEIGHT + Y_MARGIN
 
+# --- Константы ---
 CARD_BG_COLOR = (100, 100, 120)
 CARD_HIGHLIGHT_COLOR = (255, 255, 0)
 CARD_SELECTION_COLOR = (70, 170, 255)  # Светло-голубой для выделения
 TARGET_COLOR = (255, 0, 0)
-
+PUT_BOTTOM_COLOR = (255, 100, 255) # Малиновый для выбора карт для низа колоды
 FONT_COLOR = (255, 255, 255)
 PLAYER_COLOR = (100, 200, 100)
 OPPONENT_COLOR = (200, 100, 100)
@@ -67,6 +90,7 @@ class ClientState:
     active_player_id: Optional[int] = None
     game_state_dict: Dict[str, Any] = None  # Raw state from server
     network_status: str = "CONNECTING" # CONNECTING, CONNECTED, FAILED, DISCONNECTED
+    game_phase: str = "CONNECTING" # MULLIGAN, GAME_RUNNING
     selected_entity: Optional[int] = None
     hovered_entity: Optional[int] = None
     game_over: bool = False
@@ -77,6 +101,7 @@ class ClientState:
     attackers: List[int] = field(default_factory=list)  # Атакующие, подтвержденные сервером (для защитника)
     pending_attackers: List[int] = field(default_factory=list)  # Атакующие, выбираемые активным игроком
     selected_blocker: Optional[int] = None
+    pending_put_bottom_cards: List[int] = field(default_factory=list)
     block_assignments: Dict[int, int] = field(default_factory=dict) # {blocker_id: attacker_id}
     # --- Animation State ---
     animation_queue: List[Dict] = field(default_factory=list)
@@ -162,15 +187,20 @@ class CardSprite(pygame.sprite.Sprite):
         # --- Отрисовка рамок поверх всего ---
         # Красная рамка для подтвержденных атакующих (высший приоритет)
         if self.card_data.get('is_attacking'):
-            pygame.draw.rect(self.image, (255, 60, 60), self.image.get_rect(), 4)
+            pygame.draw.rect(self.image, (255, 60, 60), self.image.get_rect(), 5)
 
         # Синяя рамка для выбранных карт (атака, блок, цель заклинания)
         if is_selected:
-            pygame.draw.rect(self.image, CARD_SELECTION_COLOR, self.image.get_rect(), 4)
+            # Определяем цвет рамки в зависимости от контекста
+            selection_color = CARD_SELECTION_COLOR
+            # Если мы в фазе муллигана и карта выбрана для отправки вниз, используем другой цвет
+            if self.card_data.get('is_pending_put_bottom', False):
+                selection_color = PUT_BOTTOM_COLOR
+            pygame.draw.rect(self.image, selection_color, self.image.get_rect(), 5)
 
         # Желтая рамка для наведения (рисуется поверх синей, если оба состояния активны)
         if is_hovered:
-            pygame.draw.rect(self.image, CARD_HIGHLIGHT_COLOR, self.image.get_rect(), 3)
+            pygame.draw.rect(self.image, CARD_HIGHLIGHT_COLOR, self.image.get_rect(), 4)
 
 # --- Системы (Systems) ---
 
@@ -229,6 +259,14 @@ class StateUpdateSystem(esper.Processor):
                     self.client_state.network_status = "CONNECTED"
                     # Полное обновление состояния синхронизирует мир, но не должно менять текущую фазу хода.
                     # Фаза меняется только специальными событиями (TURN_STARTED, COMBAT_RESOLVED и т.д.),
+                    
+                    # NEW: Update game phase
+                    new_phase = game_state_dict.get("game_phase", "UNKNOWN")
+                    if new_phase != self.client_state.game_phase:
+                        print(f"--- Game phase changed to: {new_phase} ---")
+                        self.client_state.game_phase = new_phase
+                        self.client_state.pending_put_bottom_cards.clear()
+
                     # поэтому мы не сбрасываем self.client_state.phase здесь.
                     self.client_state.pending_attackers.clear()
                     self.client_state.game_over = False
@@ -532,13 +570,63 @@ class UISetupSystem(esper.Processor):
         # Clear UI from the previous frame
         self.ui_manager.clear_elements()
 
-        # Setup UI for the current frame if the game is running
-        if not self.client_state.game_over and self.client_state.game_state_dict:
+        if self.client_state.game_phase == "MULLIGAN":
+            self._setup_mulligan_ui(self.client_state)
+        elif not self.client_state.game_over and self.client_state.game_state_dict:
             self._setup_ui(self.client_state)
+
+    def _setup_mulligan_ui(self, client_state: ClientState):
+        if not client_state.game_state_dict or client_state.my_player_id is None:
+            return
+
+        my_player_data = client_state.game_state_dict.get("players", {}).get(str(client_state.my_player_id))
+        if not my_player_data:
+            return
+
+        my_mulligan_state = my_player_data.get("mulligan_state", "NONE")
+        input_system = esper.get_processor(InputSystem)
+
+        center_x, center_y = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
+
+        if my_mulligan_state == "DECIDING":
+            # Показываем кнопки "Оставить" и "Муллиган"
+            keep_button = Button("Keep Hand", pygame.Rect(center_x - 220, center_y - 25, 200, 50), self.font,
+                                 lambda: input_system.outgoing_q.put({"type": "KEEP_HAND"}))
+            mulligan_button = Button("Mulligan", pygame.Rect(center_x + 20, center_y - 25, 200, 50), self.font,
+                                     lambda: input_system.outgoing_q.put({"type": "MULLIGAN"}))
+            self.ui_manager.add_element(keep_button)
+            self.ui_manager.add_element(mulligan_button)
+
+        elif my_mulligan_state == "PUT_BOTTOM":
+            count = my_player_data.get("mulligan_put_bottom_count", 0)
+            label_text = f"Select {count} card(s) to put on the bottom of your library."
+            label = Label(label_text, (center_x, center_y - 50), self.font, (255, 255, 255), center=True)
+            self.ui_manager.add_element(label)
+
+            # Кнопка подтверждения активна, только если выбрано нужное количество карт
+            num_selected = len(client_state.pending_put_bottom_cards)
+            if num_selected == count:
+                def confirm_callback():
+                    # Отправляем копию списка, чтобы избежать race condition с сетевым потоком.
+                    cards_to_put_bottom = list(client_state.pending_put_bottom_cards)
+                    input_system.outgoing_q.put({
+                        "type": "PUT_CARDS_BOTTOM",
+                        "payload": {"card_ids": cards_to_put_bottom}
+                    })
+                    # Сразу очищаем выбор на клиенте для отзывчивости интерфейса.
+                    client_state.pending_put_bottom_cards.clear()
+
+                confirm_button = Button("Confirm", pygame.Rect(center_x - 100, center_y, 200, 50), self.font, confirm_callback)
+                self.ui_manager.add_element(confirm_button)
+
+        elif my_mulligan_state == "WAITING":
+            label = Label("Waiting for opponent to decide...", (center_x, center_y), self.medium_font, (200, 200, 200), center=True)
+            self.ui_manager.add_element(label)
 
     def _setup_ui(self, client_state: ClientState):
         """Creates and adds all necessary UI elements to the UIManager for the current frame based on game state."""
-        if client_state.active_player_id is None:
+        # Эта функция теперь вызывается только когда игра идет (не в фазе муллигана)
+        if client_state.active_player_id is None or client_state.game_phase != "GAME_RUNNING":
             return
 
         is_my_turn = client_state.active_player_id == client_state.my_player_id
@@ -660,6 +748,12 @@ class InputSystem(esper.Processor):
             if client_state.game_over:
                 continue
             
+            # NEW: Mulligan phase input
+            if client_state.game_phase == "MULLIGAN":
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    self._handle_put_bottom_click(event.pos, client_state)
+                continue # Больше никакой ввод не обрабатывается в этой фазе
+
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1: # Left click
                     self._handle_left_click(event.pos, client_state)
@@ -765,9 +859,38 @@ class InputSystem(esper.Processor):
         elif client_state.phase == GamePhase.COMBAT_DECLARE_ATTACKERS:
             if location == "BOARD" and card_type == "MINION" and card_data.get("can_attack"):
                 if clicked_entity in client_state.pending_attackers:
-                    client_state.pending_attackers.remove(clicked_entity)  # Отменить выбор
+                    client_state.pending_attackers.remove(clicked_entity)
                 else:
-                    client_state.pending_attackers.append(clicked_entity)  # Выбрать для атаки
+                    client_state.pending_attackers.append(clicked_entity)
+
+    def _handle_put_bottom_click(self, pos, client_state: ClientState):
+        """Обрабатывает клики для выбора карт для низа колоды во время муллигана."""
+        my_player_data = client_state.game_state_dict.get("players", {}).get(str(client_state.my_player_id))
+        if not my_player_data or my_player_data.get("mulligan_state") != "PUT_BOTTOM":
+            return
+
+        # Обновляем, на какую карту наведен курсор, а затем используем это состояние.
+        self._handle_mouse_motion(pos, client_state)
+        clicked_card_entity = client_state.hovered_entity
+
+        if not clicked_card_entity:
+            return
+
+        drawable = esper.component_for_entity(clicked_card_entity, Drawable)
+        card_data = drawable.sprite.card_data
+        is_my_card_in_hand = (card_data.get("owner_id") == client_state.my_player_id and
+                              card_data.get("location") == "HAND")
+
+        if not is_my_card_in_hand:
+            return
+
+        if clicked_card_entity in client_state.pending_put_bottom_cards:
+            client_state.pending_put_bottom_cards.remove(clicked_card_entity)
+        else:
+            # Проверяем, можно ли выбрать еще карты
+            count_to_put = my_player_data.get("mulligan_put_bottom_count", 0)
+            if len(client_state.pending_put_bottom_cards) < count_to_put:
+                client_state.pending_put_bottom_cards.append(clicked_card_entity)
  
     def _handle_blocking_click(self, pos, client_state: ClientState):
         """Handles clicks during the blocking phase."""
@@ -864,12 +987,16 @@ class RenderSystem(esper.Processor):
             # и правая часть карт (со статистикой) останется видимой.
             # Вы были правы: важен именно порядок вывода, а не сортировки.
             for ent, drawable, pos in reversed(all_drawable_cards):
+                # Добавляем флаг для отрисовки рамки муллигана
+                drawable.sprite.card_data['is_pending_put_bottom'] = (client_state.game_phase == "MULLIGAN" and ent in client_state.pending_put_bottom_cards)
+
                 # Если это карта под курсором, откладываем ее отрисовку
                 if ent == hovered_entity_id:
                     hovered_card_to_draw = (drawable, pos)
                     continue
 
                 is_selected = (ent == client_state.selected_entity or
+                               ent in client_state.pending_put_bottom_cards or
                                ent == client_state.selected_blocker or
                                (client_state.phase == GamePhase.COMBAT_DECLARE_ATTACKERS and ent in client_state.pending_attackers))
 
@@ -882,6 +1009,7 @@ class RenderSystem(esper.Processor):
                 drawable, pos = hovered_card_to_draw
                 # Проверяем, выбрана ли карта под курсором, чтобы передать оба состояния
                 is_selected = (hovered_entity_id == client_state.selected_entity or
+                               hovered_entity_id in client_state.pending_put_bottom_cards or
                                hovered_entity_id == client_state.selected_blocker or
                                (client_state.phase == GamePhase.COMBAT_DECLARE_ATTACKERS and hovered_entity_id in client_state.pending_attackers))
                 drawable.sprite.update_visuals(is_hovered=True, is_selected=is_selected)
