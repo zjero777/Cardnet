@@ -3,10 +3,12 @@ import esper
 
 # Импортируем все необходимые компоненты и системы
 from src.common.components import (
-    Player, CardInfo, Owner, InHand, OnBoard, ActiveTurn, Tapped, SummoningSickness, Attacking, Deck, InDeck, Graveyard, InGraveyard,
-    PlayCardCommand, AttackCommand, EndTurnCommand, DeclareBlockersCommand, SpellEffect, TapLandCommand
+    Player, CardInfo, Owner, InHand, OnBoard, ActiveTurn, Tapped, SummoningSickness, Attacking, Deck, InDeck, Graveyard,
+    InGraveyard, PlayCardCommand, DeclareAttackersCommand, EndTurnCommand, DeclareBlockersCommand, SpellEffect, TapLandCommand,
+    MulliganCommand, KeepHandCommand, MulliganDecisionPhase, KeptHand, MulliganCount, GamePhaseComponent, PutCardsBottomCommand,
+    Disconnected
 )
-from src.server.systems import PlayCardSystem, AttackSystem, TurnManagementSystem, TapLandSystem
+from src.server.systems import (PlayCardSystem, AttackSystem, TurnManagementSystem, TapLandSystem, MulliganSystem)
 
 
 class SystemsTestBase(unittest.TestCase):
@@ -44,9 +46,9 @@ class TestPlayCardSystem(SystemsTestBase):
     def test_play_minion_card_success(self):
         """Проверяет успешный розыгрыш существа."""
         # Подготовка: даем ход игроку 1 и карту в руку
-        esper.add_component(self.player1_id, ActiveTurn())
-        card_id = esper.create_entity(
-            CardInfo(name="Goblin", cost=1, attack=1, health=1, card_type="MINION"),
+        esper.add_component(self.player1_id, ActiveTurn()) #
+        card_id = esper.create_entity( #
+            CardInfo(name="Goblin", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
             Owner(player_entity_id=self.player1_id),
             InHand()
         )
@@ -75,8 +77,8 @@ class TestPlayCardSystem(SystemsTestBase):
         """Проверяет, что нельзя разыграть карту при нехватке маны."""
         esper.component_for_entity(self.player1_id, Player).mana_pool = 3
         esper.add_component(self.player1_id, ActiveTurn())
-        card_id = esper.create_entity(
-            CardInfo(name="Expensive", cost=5, attack=5, health=5, card_type="MINION"),
+        card_id = esper.create_entity( #
+            CardInfo(name="Expensive", cost=5, attack=5, health=5, max_health=5, card_type="MINION"),
             Owner(player_entity_id=self.player1_id),
             InHand()
         )
@@ -120,7 +122,6 @@ class TestPlayCardSystem(SystemsTestBase):
         self.assertIsNotNone(damage_event, "Должно быть событие PLAYER_DAMAGED")
         self.assertEqual(damage_event['payload']['player_id'], self.player2_id)
 
-
 class TestAttackSystem(SystemsTestBase):
     """Тесты для системы атаки."""
 
@@ -128,17 +129,16 @@ class TestAttackSystem(SystemsTestBase):
         """Проверяет объявление атакующего существа."""
         # Подготовка: ход игрока 1, у него на столе есть существо без "усталости от призыва"
         esper.add_component(self.player1_id, ActiveTurn())
-        attacker_id = esper.create_entity(
-            CardInfo(name="Knight", cost=3, attack=3, health=3, card_type="MINION"),
+        attacker_id = esper.create_entity( #
+            CardInfo(name="Knight", cost=3, attack=3, health=3, max_health=3, card_type="MINION"),
             Owner(player_entity_id=self.player1_id),
             OnBoard()  # Уже на столе, может атаковать
         )
 
         # Действие: создаем команду атаки на игрока 2
-        esper.create_entity(AttackCommand(
+        esper.create_entity(DeclareAttackersCommand(
             player_entity_id=self.player1_id,
-            attacker_card_id=attacker_id,
-            target_card_id=self.player2_id
+            attacker_ids=[attacker_id]
         ))
         esper.process()
 
@@ -157,53 +157,48 @@ class TestAttackSystem(SystemsTestBase):
         # 1. Игрок 1 - активный
         esper.add_component(self.player1_id, ActiveTurn())
         # 2. У игрока 1 есть существо на столе
-        attacker_id = esper.create_entity(
-            CardInfo(name="Knight", cost=3, attack=3, health=3, card_type="MINION"),
+        attacker_id = esper.create_entity( #
+            CardInfo(name="Knight", cost=3, attack=3, health=3, max_health=3, card_type="MINION"),
             Owner(player_entity_id=self.player1_id),
             OnBoard()
         )
         # 3. Существо объявляется атакующим
-        esper.add_component(attacker_id, Attacking())
-
-        # Действие:
-        # 1. Игрок 1 завершает ход, чтобы перейти к фазе боя
-        esper.create_entity(EndTurnCommand(player_entity_id=self.player1_id))
+        esper.create_entity(DeclareAttackersCommand(player_entity_id=self.player1_id, attacker_ids=[attacker_id]))
         esper.process()
 
-        # 2. Игрок 2 (защитник) не объявляет блокеров
+        # Действие: Игрок 2 (защитник) не объявляет блокеров
         esper.create_entity(DeclareBlockersCommand(player_entity_id=self.player2_id, blocks={}))
         esper.process()
 
         # Проверки:
         # 1. Здоровье игрока 2 должно уменьшиться
         player2_health = esper.component_for_entity(self.player2_id, Player).health
-        self.assertEqual(player2_health, 27, "Здоровье игрока 2 должно уменьшиться")
+        self.assertEqual(player2_health, 27, "Здоровье игрока 2 должно было уменьшиться на 3")
 
         # 2. Атакующее существо больше не должно быть помечено как Attacking
         self.assertFalse(esper.has_component(attacker_id, Attacking), "Существо не должно быть атакующим после боя")
 
         # 3. Событие об уроне должно быть в очереди
-        damage_event_found = any(e['type'] == 'PLAYER_DAMAGED' for e in self.event_queue)
-        self.assertTrue(damage_event_found, "Должно быть событие PLAYER_DAMAGED")
+        damage_event = next((e for e in self.event_queue if e['type'] == 'PLAYER_DAMAGED'), None)
+        self.assertIsNotNone(damage_event, "Должно быть событие PLAYER_DAMAGED")
+        self.assertEqual(damage_event['payload']['player_id'], self.player2_id)
 
     def test_blocked_attack_both_survive(self):
         """Проверяет бой, в котором оба существа выживают."""
         # Подготовка
         esper.add_component(self.player1_id, ActiveTurn())
-        attacker_id = esper.create_entity(
-            CardInfo(name="Attacker", cost=2, attack=2, health=4, card_type="MINION"),
+        attacker_id = esper.create_entity( #
+            CardInfo(name="Attacker", cost=2, attack=2, health=4, max_health=4, card_type="MINION"),
             Owner(player_entity_id=self.player1_id), OnBoard()
         )
-        blocker_id = esper.create_entity(
-            CardInfo(name="Blocker", cost=1, attack=1, health=3, card_type="MINION"),
+        blocker_id = esper.create_entity( #
+            CardInfo(name="Blocker", cost=1, attack=1, health=3, max_health=3, card_type="MINION"),
             Owner(player_entity_id=self.player2_id), OnBoard()
         )
-        esper.add_component(attacker_id, Attacking())
-
-        # NEW: Игрок 1 завершает основную фазу, чтобы инициировать бой
-        esper.create_entity(EndTurnCommand(player_entity_id=self.player1_id))
+        # Действие 1: Объявляем атакующих
+        esper.create_entity(DeclareAttackersCommand(player_entity_id=self.player1_id, attacker_ids=[attacker_id]))
         esper.process()
-
+        
         # Действие: игрок 2 блокирует
         esper.create_entity(DeclareBlockersCommand(player_entity_id=self.player2_id, blocks={blocker_id: attacker_id}))
         esper.process()
@@ -217,24 +212,31 @@ class TestAttackSystem(SystemsTestBase):
         self.assertTrue(esper.entity_exists(blocker_id), "Блокер должен выжить")
         self.assertEqual(esper.component_for_entity(self.player2_id, Player).health, 30, "Здоровье защитника не должно измениться")
 
+        # Проверяем событие боя
+        attack_event = next((e for e in self.event_queue if e['type'] == 'CARD_ATTACKED'), None)
+        self.assertIsNotNone(attack_event, "Должно быть событие CARD_ATTACKED")
+        payload = attack_event['payload']
+        self.assertEqual(payload['attacker_id'], attacker_id)
+        self.assertEqual(payload['target_id'], blocker_id)
+        self.assertEqual(payload['attacker_new_health'], 3)
+        self.assertEqual(payload['target_new_health'], 1)
+
     def test_blocked_attack_blocker_dies(self):
         """Проверяет бой, в котором блокер погибает."""
         # Подготовка
         esper.add_component(self.player1_id, ActiveTurn())
-        attacker_id = esper.create_entity(
-            CardInfo(name="Attacker", cost=3, attack=3, health=3, card_type="MINION"),
+        attacker_id = esper.create_entity( #
+            CardInfo(name="Attacker", cost=3, attack=3, health=3, max_health=3, card_type="MINION"),
             Owner(player_entity_id=self.player1_id), OnBoard()
         )
-        blocker_id = esper.create_entity(
-            CardInfo(name="Blocker", cost=1, attack=1, health=2, card_type="MINION"),
+        blocker_id = esper.create_entity( #
+            CardInfo(name="Blocker", cost=1, attack=1, health=2, max_health=2, card_type="MINION"),
             Owner(player_entity_id=self.player2_id), OnBoard()
         )
-        esper.add_component(attacker_id, Attacking())
-
-        # NEW: Игрок 1 завершает основную фазу, чтобы инициировать бой
-        esper.create_entity(EndTurnCommand(player_entity_id=self.player1_id))
+        # Действие 1: Объявляем атакующих
+        esper.create_entity(DeclareAttackersCommand(player_entity_id=self.player1_id, attacker_ids=[attacker_id]))
         esper.process()
-
+        
         # Действие
         esper.create_entity(DeclareBlockersCommand(player_entity_id=self.player2_id, blocks={blocker_id: attacker_id}))
         esper.process()
@@ -286,12 +288,12 @@ class TestTurnManagementSystem(SystemsTestBase):
             Owner(player_entity_id=self.player2_id), OnBoard(), Tapped()
         )
         esper.create_entity(
-            CardInfo(name="Sick Minion", cost=1, card_type="MINION"),
+            CardInfo(name="Sick Minion", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
             Owner(player_entity_id=self.player2_id), OnBoard(), SummoningSickness()
         )
         # Даем игроку 2 карту в колоду для взятия
-        card_in_deck = esper.create_entity(
-            CardInfo(name="Test Card", cost=1, card_type="MINION"),
+        card_in_deck = esper.create_entity( #
+            CardInfo(name="Test Card", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
             Owner(self.player2_id),
             InDeck()
         )
@@ -311,3 +313,291 @@ class TestTurnManagementSystem(SystemsTestBase):
             if owner.player_entity_id == self.player2_id:
                 self.assertFalse(esper.has_component(ent, Tapped), f"Карта {ent} игрока 2 должна была развернуться")
                 self.assertFalse(esper.has_component(ent, SummoningSickness), f"Карта {ent} игрока 2 не должна иметь болезнь вызова")
+
+    def test_end_of_turn_heals_creatures(self):
+        """Проверяет, что существа активного игрока лечатся в конце его хода."""
+        # Подготовка
+        esper.add_component(self.player1_id, ActiveTurn())
+        # Создаем существо с неполным здоровьем
+        damaged_minion_id = esper.create_entity(
+            CardInfo(name="Damaged Knight", cost=3, attack=3, health=1, max_health=3, card_type="MINION"),
+            Owner(player_entity_id=self.player1_id),
+            OnBoard()
+        )
+        # Создаем существо оппонента, которое не должно лечиться
+        opponent_minion_id = esper.create_entity(
+            CardInfo(name="Opponent's Minion", cost=1, attack=1, health=1, max_health=2, card_type="MINION"),
+            Owner(player_entity_id=self.player2_id),
+            OnBoard()
+        )
+
+        # Действие: игрок 1 завершает ход
+        esper.create_entity(EndTurnCommand(player_entity_id=self.player1_id))
+        esper.process()
+
+        # Проверки
+        healed_minion_info = esper.component_for_entity(damaged_minion_id, CardInfo)
+        self.assertEqual(healed_minion_info.health, 3, "Существо активного игрока должно было полностью вылечиться")
+        opponent_minion_info = esper.component_for_entity(opponent_minion_id, CardInfo)
+        self.assertEqual(opponent_minion_info.health, 1, "Существо оппонента не должно было лечиться")
+
+
+class TestGameFlow(unittest.TestCase):
+    """Тесты для общих игровых механик, таких как муллиган и смена фаз."""
+
+    def setUp(self):
+        """Настраивает мир для тестов игрового потока."""
+        esper.clear_database()
+        self.event_queue = []
+
+        # Создаем игроков
+        self.player1_id = esper.create_entity(
+            Player(player_id=1, health=30),
+            Graveyard(),
+            MulliganDecisionPhase(),
+            MulliganCount(count=0)
+        )
+        self.player2_id = esper.create_entity(
+            Player(player_id=2, health=30),
+            Graveyard(),
+            MulliganDecisionPhase(),
+            MulliganCount(count=0)
+        )
+        # Создаем карты и добавляем их ID в колоды
+        p1_deck_ids = []
+        for i in range(40):
+            card_id = esper.create_entity( #
+                CardInfo(name=f"P1 Card {i}", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
+                Owner(self.player1_id), InDeck()
+            )
+            p1_deck_ids.append(card_id)
+        p2_deck_ids = []
+        for i in range(40):
+            card_id = esper.create_entity( #
+                CardInfo(name=f"P2 Card {i}", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
+                Owner(self.player2_id), InDeck()
+            )
+            p2_deck_ids.append(card_id)
+
+        esper.add_component(self.player1_id, Deck(card_ids=p1_deck_ids))
+        esper.add_component(self.player2_id, Deck(card_ids=p2_deck_ids))
+
+        # Синглтон-компонент для фазы игры
+        esper.create_entity(GamePhaseComponent(phase="MULLIGAN"))
+
+        # Добавляем системы
+        esper.add_processor(MulliganSystem(self.event_queue))
+        esper.add_processor(TurnManagementSystem(self.event_queue))
+
+    def tearDown(self):
+        """Очищает мир и процессоры после каждого теста."""
+        esper.clear_database()
+        esper._processors.clear()
+
+    def test_mulligan_phase_to_game_running(self):
+        """Проверяет переход из фазы муллигана в основную фазу игры."""
+        game_phase_entity = esper.get_component(GamePhaseComponent)[0][0]
+        self.assertEqual(esper.component_for_entity(game_phase_entity, GamePhaseComponent).phase, "MULLIGAN")
+
+        esper.create_entity(KeepHandCommand(player_entity_id=self.player1_id))
+        esper.process()
+
+        self.assertTrue(esper.has_component(self.player1_id, KeptHand))
+        self.assertEqual(esper.component_for_entity(game_phase_entity, GamePhaseComponent).phase, "MULLIGAN")
+
+        esper.create_entity(KeepHandCommand(player_entity_id=self.player2_id))
+        esper.process()
+
+        self.assertEqual(esper.component_for_entity(game_phase_entity, GamePhaseComponent).phase, "GAME_RUNNING")
+        p1_active = esper.has_component(self.player1_id, ActiveTurn)
+        p2_active = esper.has_component(self.player2_id, ActiveTurn)
+        self.assertTrue(p1_active or p2_active, "У одного из игроков должен был начаться ход")
+
+    def _deal_hand(self, player_id, num_cards=7):
+        """Вспомогательная функция для раздачи карт в руку из колоды."""
+        deck = esper.component_for_entity(player_id, Deck)
+        for _ in range(num_cards):
+            if deck.card_ids:
+                card_to_draw = deck.card_ids.pop(0)
+                if esper.has_component(card_to_draw, InDeck):
+                    esper.remove_component(card_to_draw, InDeck)
+                esper.add_component(card_to_draw, InHand())
+
+    def test_mulligan_shuffles_deck(self):
+        """Проверяет, что при муллигане рука возвращается в колоду, и колода перемешивается."""
+        # Подготовка: раздаем стартовую руку
+        self._deal_hand(self.player1_id, 7)
+        deck_comp = esper.component_for_entity(self.player1_id, Deck)
+        hand_cards = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == self.player1_id]
+
+        # Сохраняем состояние до муллигана
+        deck_before_mulligan = list(deck_comp.card_ids)
+        full_deck_before_mulligan = deck_before_mulligan + hand_cards
+
+        # Действие: игрок берет муллиган
+        esper.create_entity(MulliganCommand(player_entity_id=self.player1_id))
+        esper.process()
+
+        # Проверки
+        new_deck_comp = esper.component_for_entity(self.player1_id, Deck)
+        new_hand_cards = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == self.player1_id]
+
+        self.assertEqual(len(new_hand_cards), 7, "Игрок должен взять 7 новых карт")
+        self.assertEqual(len(new_deck_comp.card_ids), 33, "В колоде должно остаться 33 карты")
+
+        # Проверяем, что состав колоды не изменился (только порядок)
+        full_deck_after_mulligan = new_deck_comp.card_ids + new_hand_cards
+        self.assertCountEqual(full_deck_before_mulligan, full_deck_after_mulligan, "Общий набор карт должен остаться тем же")
+
+        # Проверяем, что порядок изменился (вероятностный тест)
+        self.assertNotEqual(full_deck_before_mulligan, full_deck_after_mulligan, "Порядок карт в колоде должен был измениться после перемешивания")
+
+    def test_put_cards_bottom_after_mulligan(self):
+        """Проверяет, что после муллигана игрок кладет карты в низ колоды."""
+        # Подготовка: раздаем руку, игрок 1 берет один муллиган и решает оставить руку
+        self._deal_hand(self.player1_id, 7)
+        esper.create_entity(MulliganCommand(player_entity_id=self.player1_id))
+        esper.process()
+        esper.create_entity(KeepHandCommand(player_entity_id=self.player1_id))
+        esper.process()
+
+        # Проверка состояния: игрок должен быть в фазе "положить карты вниз"
+        self.assertFalse(esper.has_component(self.player1_id, MulliganDecisionPhase))
+        self.assertFalse(esper.has_component(self.player1_id, KeptHand), "Не должен получить KeptHand до выбора карт")
+
+        hand_cards = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == self.player1_id]
+        card_to_put_bottom = hand_cards[0]
+        deck_comp = esper.component_for_entity(self.player1_id, Deck)
+        deck_size_before = len(deck_comp.card_ids)
+
+        # Действие: игрок кладет одну карту вниз колоды
+        esper.create_entity(PutCardsBottomCommand(player_entity_id=self.player1_id, card_ids=[card_to_put_bottom]))
+        esper.process()
+
+        # Проверки
+        self.assertTrue(esper.has_component(self.player1_id, KeptHand), "Должен получить KeptHand после выбора карт")
+        new_hand_cards = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == self.player1_id]
+        self.assertEqual(len(new_hand_cards), 6, "В руке должно остаться 6 карт")
+        self.assertNotIn(card_to_put_bottom, new_hand_cards, "Выбранная карта должна уйти из руки")
+        new_deck_comp = esper.component_for_entity(self.player1_id, Deck)
+        self.assertEqual(len(new_deck_comp.card_ids), deck_size_before + 1, "Карта должна добавиться в колоду")
+        self.assertEqual(new_deck_comp.card_ids[-1], card_to_put_bottom, "Карта должна быть последней в колоде")
+
+    def test_cannot_mulligan_with_empty_hand(self):
+        """Проверяет, что игрок не может взять муллиган с пустой рукой."""
+        # Подготовка: раздаем руку, а затем забираем все карты
+        self._deal_hand(self.player1_id, 7)
+        hand_cards = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == self.player1_id]
+
+        # Забираем карты из руки
+        for card_ent in hand_cards:
+            esper.remove_component(card_ent, InHand)
+
+        mulligan_count_before = esper.component_for_entity(self.player1_id, MulliganCount).count
+
+        # Действие: пытаемся взять муллиган с пустой рукой
+        esper.create_entity(MulliganCommand(player_entity_id=self.player1_id))
+        esper.process()
+
+        # Проверки
+        mulligan_count_after = esper.component_for_entity(self.player1_id, MulliganCount).count
+        self.assertEqual(mulligan_count_after, mulligan_count_before, "Счетчик муллиганов не должен был увеличиться")
+        final_hand = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == self.player1_id]
+        self.assertEqual(len(final_hand), 0, "Игрок не должен был взять новые карты")
+        self.assertTrue(esper.has_component(self.player1_id, MulliganDecisionPhase), "Игрок должен остаться в фазе решения о муллигане")
+
+    def test_mulligan_action(self):
+        """Проверяет, что команда муллигана увеличивает счетчик."""
+        # Сначала нужно раздать руку, т.к. нельзя сделать муллиган с пустой рукой
+        self._deal_hand(self.player1_id, 7)
+        self.assertEqual(esper.component_for_entity(self.player1_id, MulliganCount).count, 0)
+        esper.create_entity(MulliganCommand(player_entity_id=self.player1_id))
+        esper.process()
+        self.assertEqual(esper.component_for_entity(self.player1_id, MulliganCount).count, 1)
+        self.assertTrue(esper.has_component(self.player1_id, MulliganDecisionPhase))
+
+    def test_cannot_mulligan_if_not_enough_cards_total(self):
+        """Проверяет, что игрок не может взять муллиган, если в сумме в руке и колоде меньше 7 карт."""
+        # Подготовка:
+        # 1. Уменьшаем колоду игрока до 6 карт.
+        deck_comp = esper.component_for_entity(self.player1_id, Deck)
+        deck_comp.card_ids = deck_comp.card_ids[:6]
+
+        # 2. Раздаем эти 6 карт в руку. В колоде 0 карт.
+        self._deal_hand(self.player1_id, 6)
+
+        hand_after_dealing = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == self.player1_id]
+        self.assertEqual(len(hand_after_dealing), 6)
+        self.assertEqual(len(deck_comp.card_ids), 0)
+
+        mulligan_count_before = esper.component_for_entity(self.player1_id, MulliganCount).count
+
+        # Действие: пытаемся взять муллиган. В сумме 6 карт, должно провалиться.
+        esper.create_entity(MulliganCommand(player_entity_id=self.player1_id))
+        esper.process()
+
+        # Проверки:
+        mulligan_count_after = esper.component_for_entity(self.player1_id, MulliganCount).count
+        self.assertEqual(mulligan_count_after, mulligan_count_before, "Счетчик муллиганов не должен был увеличиться")
+
+        final_hand = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == self.player1_id]
+        self.assertCountEqual(final_hand, hand_after_dealing, "Рука не должна была измениться")
+
+        error_event = next((e for e in self.event_queue if e['type'] == 'ACTION_ERROR'), None)
+        self.assertIsNotNone(error_event, "Должно быть событие ACTION_ERROR")
+        self.assertEqual(error_event['payload']['message'], "Недостаточно карт в колоде для муллигана.")
+
+    def test_mulligan_count_limit(self):
+        """Проверяет, что игрок не может взять муллиган, если это приведет к невозможности завершить фазу."""
+        # Подготовка:
+        # 1. Раздаем руку игроку.
+        self._deal_hand(self.player1_id, 7)
+
+        # 2. Устанавливаем счетчик муллиганов на 6.
+        mulligan_counter = esper.component_for_entity(self.player1_id, MulliganCount)
+        mulligan_counter.count = 6
+
+        # Действие 1: Берем 7-й муллиган. Это должно сработать.
+        esper.create_entity(MulliganCommand(player_entity_id=self.player1_id))
+        esper.process()
+
+        # Проверка 1:
+        self.assertEqual(esper.component_for_entity(self.player1_id, MulliganCount).count, 7, "Счетчик муллиганов должен стать 7")
+        hand_after_mulligan = [ent for ent, (owner, _) in esper.get_components(Owner, InHand) if owner.player_entity_id == self.player1_id]
+        self.assertEqual(len(hand_after_mulligan), 7, "Игрок должен был взять 7 новых карт")
+
+        # Действие 2: Пытаемся взять 8-й муллиган. Это должно провалиться.
+        esper.create_entity(MulliganCommand(player_entity_id=self.player1_id))
+        esper.process()
+
+        # Проверка 2:
+        self.assertEqual(esper.component_for_entity(self.player1_id, MulliganCount).count, 7, "Счетчик муллиганов не должен был увеличиться")
+        error_event = next((e for e in self.event_queue if e['type'] == 'ACTION_ERROR'), None)
+        self.assertIsNotNone(error_event, "Должно быть событие ACTION_ERROR")
+        self.assertEqual(error_event['payload']['message'], "Нельзя взять больше муллиганов.")
+
+    def test_game_does_not_start_if_player_disconnected(self):
+        """Проверяет, что игра не начинается, если один из игроков отключен во время муллигана."""
+        # Подготовка: игрок 1 подтверждает руку, а игрок 2 отключается
+        esper.create_entity(KeepHandCommand(player_entity_id=self.player1_id))
+        esper.process()
+
+        # Добавляем компонент Disconnected игроку 2
+        esper.add_component(self.player2_id, Disconnected())
+
+        # Действие: игрок 2 (уже отключенный) отправляет команду KeepHand (это может случиться, если команда была в пути)
+        esper.create_entity(KeepHandCommand(player_entity_id=self.player2_id))
+        esper.process()
+
+        # Проверки:
+        game_phase_entity = esper.get_component(GamePhaseComponent)[0][0]
+        self.assertEqual(esper.component_for_entity(game_phase_entity, GamePhaseComponent).phase, "MULLIGAN",
+                         "Игра должна оставаться в фазе муллигана, если кто-то отключен")
+
+        # Теперь симулируем переподключение игрока 2
+        esper.remove_component(self.player2_id, Disconnected)
+        esper.process()  # Запускаем цикл еще раз, чтобы система проверила состояние
+
+        # Проверка после переподключения:
+        self.assertEqual(esper.component_for_entity(game_phase_entity, GamePhaseComponent).phase, "GAME_RUNNING",
+                         "Игра должна начаться после переподключения всех игроков")

@@ -3,18 +3,19 @@
 
 --- РЕАЛИЗОВАНО ---
 - Графический интерфейс на Pygame.
+- Главное меню, браузер серверов в локальной сети.
+- Интерактивное лобби с чатом и системой готовности.
 - Асинхронное сетевое взаимодействие в отдельном потоке.
 - Отображение игрового поля, карт в руке и на столе.
 - ECS (esper) для управления состоянием на клиенте.
 - Обработка базовых действий игрока (клик по карте, кнопкам).
+- Обработка отключений и переподключений игроков.
 - Система фаз хода (Главная 1, Атака, Блок, Главная 2).
 - Базовые анимации (урон, уничтожение карты).
 - UI-менеджер для кнопок и текстовых меток.
 - Отображение статуса подключения и лога событий.
 
 --- ПЛАН РАЗРАБОТКИ (TODO) ---
-- Главное меню, настройки, выход из игры.
-- Экран лобби для ожидания оппонента.
 - Интерфейс для составления колод (Deck Builder).
 - Улучшенные визуальные эффекты и анимации.
 - Звуковые эффекты и музыкальное сопровождение.
@@ -23,6 +24,7 @@
 import asyncio
 import json
 import argparse
+import socket
 import sys
 import threading
 import queue
@@ -30,10 +32,12 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+import time
 import pygame
 import esper
 
-from .ui import UIManager, Button, Label, CONFIRM_BUTTON_COLOR, CONFIRM_BUTTON_HOVER_COLOR, CONFIRM_BUTTON_PRESSED_COLOR, CONFIRM_BUTTON_TEXT_COLOR, TURN_INDICATOR_PLAYER_COLOR, TURN_INDICATOR_OPPONENT_COLOR
+from .ui import (UIManager, Button, Label, TextInput, CONFIRM_BUTTON_COLOR, CONFIRM_BUTTON_HOVER_COLOR,
+                 CONFIRM_BUTTON_PRESSED_COLOR, CONFIRM_BUTTON_TEXT_COLOR, TURN_INDICATOR_PLAYER_COLOR, TURN_INDICATOR_OPPONENT_COLOR, MENU_BUTTON_BG, MENU_BUTTON_HOVER, MENU_BUTTON_PRESSED, MENU_BUTTON_TEXT)
 
 # --- Константы ---
 SCREEN_WIDTH = 1280
@@ -74,6 +78,8 @@ OPPONENT_COLOR = (200, 100, 100)
 ATTACK_READY_COLOR = (0, 255, 0)
 
 # --- Компоненты (Components) ---
+BROADCAST_PORT = 8889
+
 
 class GamePhase(Enum):
     """Определяет текущую фазу хода игрока, следуя логике MTG."""
@@ -89,8 +95,11 @@ class ClientState:
     my_player_id: Optional[int] = None
     active_player_id: Optional[int] = None
     game_state_dict: Dict[str, Any] = None  # Raw state from server
-    network_status: str = "CONNECTING" # CONNECTING, CONNECTED, FAILED, DISCONNECTED
-    game_phase: str = "CONNECTING" # MULLIGAN, GAME_RUNNING
+    network_status: str = "OFFLINE"  # OFFLINE, CONNECTING, CONNECTED, FAILED, DISCONNECTED
+    game_phase: str = "MAIN_MENU"  # MAIN_MENU, SERVER_BROWSER, CONNECTING, LOBBY, MULLIGAN, GAME_RUNNING
+    server_list: Dict[str, Dict] = field(default_factory=dict) # Discovered servers: {(ip, port): data}
+    server_browser_enter_time: float = 0.0
+    lobby_state: Dict[str, Any] = field(default_factory=dict) # State of player sessions in the lobby
     selected_entity: Optional[int] = None
     hovered_entity: Optional[int] = None
     game_over: bool = False
@@ -110,6 +119,8 @@ class ClientState:
     # --- Event Log ---
     log_messages: List[str] = field(default_factory=list)
     max_log_messages: int = LOG_LINES
+    chat_messages: List[Dict] = field(default_factory=list)
+    max_chat_messages: int = 10
 
 @dataclass
 class Position:
@@ -205,14 +216,55 @@ class CardSprite(pygame.sprite.Sprite):
         # Рамки рисуются поверх всего остального
         self._draw_interaction_borders(is_hovered, is_selected)
 
+
+class ServerDiscoveryThread(threading.Thread):
+    """Поток для обнаружения серверов в локальной сети по UDP broadcast."""
+    def __init__(self, discovery_q: queue.Queue):
+        super().__init__(daemon=True)
+        self.discovery_q = discovery_q
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # SO_REUSEADDR позволяет нескольким клиентам на одной машине слушать broadcast
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(('', BROADCAST_PORT))
+        except OSError as e:
+            # Адрес уже используется, возможно другой клиент запущен
+            self.discovery_q.put({"type": "DISCOVERY_ERROR", "payload": {"message": f"Could not bind to port {BROADCAST_PORT}: {e}"}})
+            return
+        
+        sock.settimeout(1.0) # Таймаут, чтобы проверять self.running
+        
+        while self.running:
+            try:
+                data, addr = sock.recvfrom(1024)
+                server_info = json.loads(data.decode('utf-8'))
+                server_info['ip'] = addr[0]
+                self.discovery_q.put({"type": "SERVER_FOUND", "payload": server_info})
+            except socket.timeout:
+                continue
+            except (json.JSONDecodeError, KeyError):
+                # Игнорируем некорректные пакеты
+                continue
+            except Exception as e:
+                print(f"Error in discovery thread: {e}")
+        
+        sock.close()
 # --- Системы (Systems) ---
 
 class StateUpdateSystem(esper.Processor):
     """Processes messages from the server and updates the client's ECS world."""
-    def __init__(self, incoming_q: queue.Queue, font: pygame.font.Font, client_state: ClientState):
+    def __init__(self, incoming_q: queue.Queue, discovery_q: queue.Queue, font: pygame.font.Font, client_state: ClientState):
         self.incoming_q = incoming_q
+        self.discovery_q = discovery_q # new
         self.font = font
         self.client_state = client_state
+        self.server_timeout = 15.0 # seconds
 
     def _add_log_message(self, message: str):
         """Добавляет сообщение в лог и обрезает его до максимального размера."""
@@ -244,6 +296,32 @@ class StateUpdateSystem(esper.Processor):
  
     def process(self, *args, **kwargs):
         try:
+            # NEW: Process discovery queue
+            while True:
+                event = self.discovery_q.get_nowait()
+                event_type = event.get("type")
+
+                if event_type == "SERVER_FOUND":
+                    server_info = event["payload"]
+                    server_key = (server_info['ip'], server_info['tcp_port'])
+                    server_info['last_seen'] = time.time()
+                    self.client_state.server_list[server_key] = server_info
+                elif event_type == "DISCOVERY_ERROR":
+                    # Maybe show this error to the user
+                    print(f"Discovery Error: {event['payload']['message']}")
+
+        except queue.Empty:
+            pass
+
+        # NEW: Prune stale servers from the list
+        now = time.time()
+        stale_keys = [
+            key for key, info in self.client_state.server_list.items()
+            if now - info.get('last_seen', 0) > self.server_timeout
+        ]
+        for key in stale_keys:
+            del self.client_state.server_list[key]
+        try:
             while True:
                 event = self.incoming_q.get_nowait()
                 event_type = event.get("type")
@@ -253,6 +331,12 @@ class StateUpdateSystem(esper.Processor):
 
                 elif event_type == "CONNECTION_SUCCESS":
                     self.client_state.network_status = "CONNECTED"
+                    self.client_state.game_phase = "LOBBY"
+
+                elif event_type == "LOBBY_UPDATE":
+                    # Server sent an update while we are in the lobby
+                    self.client_state.game_phase = "LOBBY"
+                    self.client_state.lobby_state = event.get("payload", {}).get("sessions", {})
 
                 elif event_type == "FULL_STATE_UPDATE":
                     game_state_dict = event.get("payload", {})
@@ -420,9 +504,20 @@ class StateUpdateSystem(esper.Processor):
                     self.client_state.animation_queue.append(event)
                     card_name = self._get_entity_name(card_id)
                     self._add_log_message(f"'{card_name}' уничтожена.")
-                    # Deletion is now handled by AnimationSystem after the animation plays.
+                elif event_type == "CHAT_MESSAGE":
+                    payload = event.get("payload", {})
+                    sender_id = payload.get("sender_id")
+                    text = payload.get("text")
+                    sender_name = f"Игрок {sender_id}"
+                    if sender_id == self.client_state.my_player_id:
+                        sender_name = "Вы"
+
+                    self.client_state.chat_messages.append({"sender": sender_name, "text": text})
+                    if len(self.client_state.chat_messages) > self.client_state.max_chat_messages:
+                        self.client_state.chat_messages.pop(0)
         except queue.Empty:
             pass
+
 
     def _synchronize_world(self, state: Dict[str, Any]):
         """Re-creates the client world based on server state."""
@@ -563,20 +658,143 @@ class AnimationSystem(esper.Processor):
 
 class UISetupSystem(esper.Processor):
     """Prepares UI elements for the current frame before input is handled."""
-    def __init__(self, client_state: ClientState, ui_manager: UIManager, font: pygame.font.Font, medium_font: pygame.font.Font):
+    def __init__(self, client_state: ClientState, ui_manager: UIManager, font: pygame.font.Font, medium_font: pygame.font.Font, start_connection_callback, reset_to_menu_callback, disconnect_callback, chat_input_ref):
         self.client_state = client_state
         self.ui_manager = ui_manager
         self.font = font
         self.medium_font = medium_font
+        self.start_connection = start_connection_callback
+        self.reset_to_menu = reset_to_menu_callback
+        self.disconnect_and_go_back = disconnect_callback
+        self.chat_input = chat_input_ref
 
     def process(self, *args, **kwargs):
         # Clear UI from the previous frame
         self.ui_manager.clear_elements()
 
-        if self.client_state.game_phase == "MULLIGAN":
+        if self.client_state.game_phase == "MAIN_MENU":
+            self._setup_main_menu_ui()
+            return
+
+        if self.client_state.game_phase == "SERVER_BROWSER": # NEW
+            self._setup_server_browser_ui()
+            return
+
+        if self.client_state.network_status in ["FAILED", "DISCONNECTED"]:
+            self._setup_error_ui()
+            return
+
+        # Если оппонент отключен, не показываем никаких интерактивных элементов.
+        # Оверлей будет нарисован RenderSystem.
+        opponent_id = next((pid for pid in self.client_state.player_connection_status if pid != self.client_state.my_player_id), None)
+        if opponent_id is not None and self.client_state.player_connection_status.get(opponent_id) == "DISCONNECTED":
+            # Не создаем никаких кнопок.
+            return
+
+        if self.client_state.game_phase == "CONNECTING":
+            # No UI elements while connecting, RenderSystem shows a message
+            pass
+        elif self.client_state.game_phase == "LOBBY":
+            self._setup_lobby_ui()
+        elif self.client_state.game_phase == "MULLIGAN":
             self._setup_mulligan_ui(self.client_state)
         elif not self.client_state.game_over and self.client_state.game_state_dict:
             self._setup_ui(self.client_state)
+
+    def _setup_main_menu_ui(self):
+        """Создает кнопки для главного меню."""
+        center_x = SCREEN_WIDTH // 2
+
+        # Располагаем кнопки ниже центра
+        button_y_start = SCREEN_HEIGHT * 0.5
+        button_width = 350
+        button_height = 60
+        button_spacing = 30
+
+        join_button = Button(
+            "Присоединиться к игре",
+            pygame.Rect(center_x - button_width // 2, button_y_start, button_width, button_height),
+            self.font,
+            lambda: setattr(self.client_state, 'game_phase', 'SERVER_BROWSER'),
+            bg_color=MENU_BUTTON_BG, hover_color=MENU_BUTTON_HOVER, pressed_color=MENU_BUTTON_PRESSED, text_color=MENU_BUTTON_TEXT
+        )
+        quit_button = Button(
+            "Выход",
+            pygame.Rect(center_x - button_width // 2, button_y_start + button_height + button_spacing, button_width, button_height),
+            self.font,
+            lambda: setattr(self.client_state, 'my_player_id', -999),
+            bg_color=MENU_BUTTON_BG, hover_color=MENU_BUTTON_HOVER, pressed_color=MENU_BUTTON_PRESSED, text_color=MENU_BUTTON_TEXT
+        )
+        self.ui_manager.add_element(join_button)
+        self.ui_manager.add_element(quit_button)
+
+    def _setup_error_ui(self):
+        """Создает кнопку "Назад в меню" на экране ошибки."""
+        center_x, center_y = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 50
+        back_button = Button("В меню", pygame.Rect(center_x - 100, center_y, 200, 50), self.font, self.reset_to_menu)
+        self.ui_manager.add_element(back_button)
+
+    def _setup_server_browser_ui(self): # NEW
+        """Создает UI для списка серверов."""
+        # Кнопка "Назад"
+        back_button = Button("Назад", pygame.Rect(20, SCREEN_HEIGHT - 70, 150, 50), self.font, self.reset_to_menu)
+        self.ui_manager.add_element(back_button)
+
+        # Кнопки для каждого найденного сервера
+        y_pos = SCREEN_HEIGHT * 0.3 # Начинаем ниже, чтобы освободить место для заголовка
+        for (ip, port), server_info in sorted(self.client_state.server_list.items()):
+            server_name = server_info.get('server_name', 'Unknown Server')
+            players = server_info.get('players', '?/?')
+            status = server_info.get('status', 'UNKNOWN')
+            
+            button_text = f"{server_name} - {players} - {status} ({ip}:{port})"
+            
+            def make_callback(h, p):
+                return lambda: self.start_connection(h, p)
+
+            server_button = Button(button_text, pygame.Rect(SCREEN_WIDTH // 2 - 300, y_pos, 600, 40), self.font, make_callback(ip, port))
+            self.ui_manager.add_element(server_button)
+            y_pos += 50
+
+    def _setup_lobby_ui(self):
+        """Создает UI для лобби, включая кнопку готовности."""
+        my_id = self.client_state.my_player_id
+        if my_id is None:
+            return
+
+        my_session_data = self.client_state.lobby_state.get(str(my_id))
+        if not my_session_data:
+            return
+
+        # Если игрок еще не готов, показываем кнопку "Готов"
+        if not my_session_data.get("ready", False):
+            input_system = esper.get_processor(InputSystem)
+            def ready_callback():
+                input_system.outgoing_q.put({"type": "PLAYER_READY"})
+
+            ready_button = Button(
+                "Готов",
+                pygame.Rect(SCREEN_WIDTH - 150 - 20, SCREEN_HEIGHT - 70, 150, 50),
+                self.font,
+                ready_callback,
+                bg_color=CONFIRM_BUTTON_COLOR,
+                hover_color=CONFIRM_BUTTON_HOVER_COLOR,
+                pressed_color=CONFIRM_BUTTON_PRESSED_COLOR,
+                text_color=CONFIRM_BUTTON_TEXT_COLOR
+            )
+            self.ui_manager.add_element(ready_button)
+
+        # Добавляем поле ввода чата в UI менеджер, чтобы оно отрисовалось
+        self.ui_manager.add_element(self.chat_input)
+
+        back_button = Button(
+            "Назад",
+            pygame.Rect(20, SCREEN_HEIGHT - 70, 150, 50),
+            self.font,
+            self.disconnect_and_go_back,
+            bg_color=MENU_BUTTON_BG, hover_color=MENU_BUTTON_HOVER, pressed_color=MENU_BUTTON_PRESSED, text_color=MENU_BUTTON_TEXT
+        )
+        self.ui_manager.add_element(back_button)
 
     def _setup_mulligan_ui(self, client_state: ClientState):
         if not client_state.game_state_dict or client_state.my_player_id is None:
@@ -699,10 +917,11 @@ class UISetupSystem(esper.Processor):
 
 class InputSystem(esper.Processor):
     """Handles user input and creates commands to be sent to the server."""
-    def __init__(self, outgoing_q: queue.Queue, client_state: ClientState, ui_manager: UIManager):
+    def __init__(self, outgoing_q: queue.Queue, client_state: ClientState, ui_manager: UIManager, chat_input_ref: TextInput):
         self.outgoing_q = outgoing_q
         self.client_state = client_state
         self.ui_manager = ui_manager
+        self.chat_input = chat_input_ref
 
     def declare_attackers(self):
         """Отправляет на сервер список выбранных атакующих и переводит клиента в состояние ожидания."""
@@ -727,18 +946,29 @@ class InputSystem(esper.Processor):
     def process(self, *args, **kwargs):
         client_state = self.client_state
 
+        # Определяем, нужно ли блокировать ввод из-за отключения оппонента.
+        opponent_id = next((pid for pid in client_state.player_connection_status if pid != client_state.my_player_id), None)
+        is_opponent_disconnected = (opponent_id is not None and client_state.player_connection_status.get(opponent_id) == "DISCONNECTED")
+
         # Обновляем информацию о наведении мыши каждый кадр, а не только по событию
-        self._handle_mouse_motion(pygame.mouse.get_pos(), client_state)
+        # Только если игра интерактивна
+        if not is_opponent_disconnected:
+            self._handle_mouse_motion(pygame.mouse.get_pos(), client_state)
 
         for event in pygame.event.get():
-            # Let the UI Manager process the event first. If it handles it, we skip the game logic for this event.
-            if self.ui_manager.process_event(event):
-                continue
-
+            # Событие выхода обрабатывается всегда
             if event.type == pygame.QUIT:
                 self.outgoing_q.put(None) # Signal network thread to close
                 client_state.my_player_id = -999 # Сигнал для выхода из главного цикла
                 return
+
+            # Если оппонент отключен, игнорируем все остальные события ввода
+            if is_opponent_disconnected:
+                continue
+
+            # Let the UI Manager process the event first. If it handles it, we skip the game logic for this event.
+            if self.ui_manager.process_event(event):
+                continue
 
             # Если соединение не удалось или разорвано, ждем любого ввода для выхода
             if client_state.network_status in ["FAILED", "DISCONNECTED"]:
@@ -751,6 +981,21 @@ class InputSystem(esper.Processor):
             if client_state.game_over:
                 continue
             
+            # Обработка ввода для чата в лобби
+            if client_state.game_phase == "LOBBY":
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    self.chat_input.is_active = self.chat_input.rect.collidepoint(event.pos)
+                
+                if self.chat_input.is_active and event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_RETURN:
+                        if self.chat_input.text:
+                            self.outgoing_q.put({"type": "CHAT_MESSAGE", "payload": {"text": self.chat_input.text}})
+                            self.chat_input.text = ""
+                    elif event.key == pygame.K_BACKSPACE:
+                        self.chat_input.text = self.chat_input.text[:-1]
+                    elif len(self.chat_input.text) < self.chat_input.max_len:
+                        self.chat_input.text += event.unicode
+
             # NEW: Mulligan phase input
             if client_state.game_phase == "MULLIGAN":
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -790,6 +1035,11 @@ class InputSystem(esper.Processor):
         client_state.hovered_entity = top_card
 
     def _handle_left_click(self, pos, client_state: ClientState):
+        # Добавляем проверку: обрабатываем клики по игровым объектам (карты, портреты)
+        # только тогда, когда игра находится в активной фазе.
+        if client_state.game_phase != "GAME_RUNNING":
+            return
+
         # --- Phase-specific logic first ---
         is_my_turn = client_state.active_player_id == client_state.my_player_id
         if not is_my_turn:
@@ -954,23 +1204,31 @@ class RenderSystem(esper.Processor):
         self.screen = screen
         self.client_state = client_state
         self.ui_manager = ui_manager
-        self.font = font
+        self.font = font # Regular font
         self.medium_font = medium_font
         self.log_font = log_font
         self.big_font = big_font
         self.emoji_font = emoji_font
+        # Сделаем шрифт для заголовка крупнее
+        self.title_font = self.big_font
 
     def process(self, *args, **kwargs):
         client_state = self.client_state
         self.screen.fill(BG_COLOR)
 
-        if client_state.network_status == "CONNECTING":
+        if client_state.game_phase == "MAIN_MENU":
+            self._draw_main_menu_screen()
+        elif client_state.game_phase == "SERVER_BROWSER": # NEW
+            self._draw_server_browser_screen()
+        elif client_state.network_status == "CONNECTING":
             self._draw_message_screen("Подключение к серверу...", (200, 200, 200))
         elif client_state.network_status in ["FAILED", "DISCONNECTED"]:
             reason = "Не удалось подключиться к серверу."
             if client_state.network_status == "DISCONNECTED":
                 reason = "Соединение с сервером потеряно."
             self._draw_message_screen(f"{reason}\nНажмите любую клавишу для выхода.", (255, 100, 100))
+        elif client_state.game_phase == "LOBBY":
+            self._draw_lobby_screen(client_state)
         elif client_state.game_over:
             self._draw_game_over_screen(client_state)
         else:
@@ -1073,7 +1331,95 @@ class RenderSystem(esper.Processor):
             # Draw all UI elements managed by the UIManager
             self.ui_manager.draw(self.screen)
 
+        # UI рисуется поверх всего, даже на экранах сообщений
+        self.ui_manager.draw(self.screen)
         pygame.display.flip()
+
+    def _draw_server_browser_screen(self): # NEW
+        """Рисует экран списка серверов."""
+        if self.client_state.server_list:
+            title_text = "Выберите сервер"
+            title_color = (255, 255, 255)
+        else:
+            title_text = "Поиск серверов..."
+            title_color = (200, 200, 200)
+
+        title_surf = self.medium_font.render(title_text, True, title_color)
+        title_rect = title_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT * 0.15))
+        self.screen.blit(title_surf, title_rect)
+
+        # Показываем сообщение "серверы не найдены" только после небольшой задержки,
+        # чтобы дать время на их обнаружение.
+        # Сервер рассылает broadcast каждые 5 секунд, поэтому ждем чуть больше двух циклов.
+        SEARCH_TIMEOUT = 11.0 # seconds
+        time_since_search_started = time.time() - self.client_state.server_browser_enter_time
+
+        if not self.client_state.server_list and time_since_search_started > SEARCH_TIMEOUT:
+            no_servers_text = self.font.render("Серверы не найдены. Убедитесь, что сервер запущен в вашей сети.", True, (200, 200, 200))
+            text_rect = no_servers_text.get_rect(centerx=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT // 2)
+            self.screen.blit(no_servers_text, text_rect)
+
+    def _draw_main_menu_screen(self):
+        # Рисуем заголовок вверху экрана
+        title_surf = self.title_font.render("Cardnet", True, (255, 215, 0))
+        title_rect = title_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT * 0.2))
+        self.screen.blit(title_surf, title_rect)
+
+    def _draw_lobby_screen(self, client_state: ClientState):
+        """Рисует экран лобби в ожидании игроков."""
+        title_surf = self.title_font.render("Лобби", True, (255, 215, 0))
+        title_rect = title_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT * 0.1))
+        self.screen.blit(title_surf, title_rect)
+
+        lobby_state = client_state.lobby_state
+        if not lobby_state:
+            return
+
+        # --- Отрисовка списка игроков ---
+        y_start = SCREEN_HEIGHT * 0.25
+
+        for player_id_str, session_data in sorted(lobby_state.items()):
+            player_id = int(player_id_str)
+            status = session_data.get("status", "UNKNOWN")
+            is_ready = session_data.get("ready", False)
+
+            ready_text = " (Готов)" if is_ready else " (Не готов)"
+            color = (100, 255, 100) if is_ready else (255, 200, 100)
+            if status != "CONNECTED":
+                color = (255, 100, 100)
+                ready_text = ""
+
+            text = f"Игрок {player_id}: {status}{ready_text}"
+            
+            if player_id == client_state.my_player_id:
+                text += " (Вы)"
+
+            text_surf = self.medium_font.render(text, True, color)
+            text_rect = text_surf.get_rect(centerx=SCREEN_WIDTH // 2, y=y_start)
+            self.screen.blit(text_surf, text_rect)
+            y_start += self.medium_font.get_height() + 10
+
+        # --- Отрисовка чата ---
+        chat_log_rect = pygame.Rect(200, SCREEN_HEIGHT - 200, SCREEN_WIDTH - 400, 150)
+        pygame.draw.rect(self.screen, (20, 20, 25, 180), chat_log_rect, border_radius=5)
+        
+        chat_y = chat_log_rect.bottom - 25
+        for msg in reversed(client_state.chat_messages):
+            sender_text = f"<{msg['sender']}> "
+            message_text = msg['text']
+
+            sender_color = (255, 215, 0)  # Gold for sender
+            message_color = (240, 240, 240) # Brighter white for message
+
+            sender_surf = self.font.render(sender_text, True, sender_color)
+            message_surf = self.font.render(message_text, True, message_color)
+
+            self.screen.blit(sender_surf, (chat_log_rect.x + 10, chat_y))
+            self.screen.blit(message_surf, (chat_log_rect.x + 10 + sender_surf.get_width(), chat_y))
+
+            chat_y -= self.font.get_height() + 2
+            if chat_y < chat_log_rect.top:
+                break
 
     def _draw_game_over_screen(self, client_state: ClientState):
         if client_state.winner_id == client_state.my_player_id:
@@ -1087,17 +1433,18 @@ class RenderSystem(esper.Processor):
         text_rect = text_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
         self.screen.blit(text_surf, text_rect)
 
-    def _draw_message_screen(self, text: str, color: tuple):
+    def _draw_message_screen(self, text: str, color: tuple, font: Optional[pygame.font.Font] = None):
         """Вспомогательная функция для отрисовки центрированного сообщения на экране."""
+        font_to_use = font or self.medium_font
         lines = text.split('\n')
-        total_height = len(lines) * self.medium_font.get_height()
+        total_height = len(lines) * font_to_use.get_height()
         start_y = (SCREEN_HEIGHT - total_height) // 2
 
         for i, line in enumerate(lines):
-            text_surf = self.medium_font.render(line, True, color)
-            text_rect = text_surf.get_rect(
+            text_surf = font_to_use.render(line, True, color)
+            text_rect = text_surf.get_rect( #
                 centerx=SCREEN_WIDTH // 2, 
-                y=start_y + i * self.medium_font.get_height())
+                y=start_y + i * font_to_use.get_height())
             self.screen.blit(text_surf, text_rect)
 
     def _draw_animation(self, animation_event: Dict[str, Any]):
@@ -1299,41 +1646,158 @@ class PygameClient:
         self.running = True
         self.incoming_queue = queue.Queue()
         self.outgoing_queue = queue.Queue()
+        self.discovery_queue = queue.Queue()
+        self.host = host
+        self.port = port
+        self.network_thread = None # Будет создан при подключении
+        self.discovery_thread = None
+        self.chat_input = TextInput(
+            rect=pygame.Rect(200, SCREEN_HEIGHT - 45, SCREEN_WIDTH - 400, 35),
+            font=self.font,
+            text_color=MENU_BUTTON_TEXT
+        )
+
+    def start_discovery(self):
+        """Инициирует поток для поиска серверов."""
+        if self.discovery_thread and self.discovery_thread.is_alive():
+            return
+        self.discovery_thread = ServerDiscoveryThread(self.discovery_queue)
+        self.discovery_thread.start()
+
+    def stop_discovery(self):
+        """Останавливает поток поиска серверов."""
+        if self.discovery_thread:
+            self.discovery_thread.stop()
+            self.discovery_thread.join(timeout=0.2)
+            self.discovery_thread = None
+        # Очищаем список серверов, когда прекращаем поиск
+        self.client_state.server_list.clear()
+
+    def start_connection(self, host, port):
+        """Инициирует новое подключение к серверу."""
+        if self.network_thread and self.network_thread.is_alive():
+            return # Уже идет попытка подключения или подключено
+
+        self.stop_discovery()  # Останавливаем поиск серверов при попытке подключения
+        self.client_state.network_status = "CONNECTING"
+        self.client_state.game_phase = "CONNECTING"
+
         self.network_thread = NetworkThread(self.incoming_queue, self.outgoing_queue, host, port)
+        self.network_thread.start()
+
+    def disconnect_and_go_to_server_browser(self):
+        """Disconnects from the current server and returns to the server browser."""
+        if self.network_thread and self.network_thread.is_alive():
+            self.outgoing_queue.put(None)
+            self.network_thread.join(timeout=0.2)
+        self.network_thread = None
+
+        cs = self.client_state
+        cs.my_player_id = None
+        cs.active_player_id = None
+        cs.game_state_dict = None
+        cs.network_status = "OFFLINE"
+        cs.game_phase = "SERVER_BROWSER"
+        # Don't clear server_list
+        cs.server_browser_enter_time = 0.0
+        cs.lobby_state.clear()
+        cs.selected_entity = None
+        cs.hovered_entity = None
+        cs.game_over = False
+        cs.winner_id = None
+        cs.player_connection_status.clear()
+        cs.phase = GamePhase.MAIN_1
+        cs.attackers.clear()
+        cs.pending_attackers.clear()
+        cs.selected_blocker = None
+        cs.pending_put_bottom_cards.clear()
+        cs.block_assignments.clear()
+
+    def reset_to_menu(self):
+        """Сбрасывает состояние клиента в главное меню."""
+        self.stop_discovery()
+        if self.network_thread and self.network_thread.is_alive():
+            # Поток должен был умереть сам при ошибке, но на всякий случай
+            self.network_thread.join(timeout=0.1)
+
+        self.network_thread = None
+        # Reset the existing ClientState object instead of creating a new one.
+        # This ensures all systems that hold a reference to it see the changes.
+        cs = self.client_state
+        cs.my_player_id = None
+        cs.active_player_id = None
+        cs.game_state_dict = None
+        cs.network_status = "OFFLINE"
+        cs.game_phase = "MAIN_MENU"
+        cs.server_list.clear()
+        cs.server_browser_enter_time = 0.0
+        cs.lobby_state.clear()
+        cs.selected_entity = None
+        cs.hovered_entity = None
+        cs.game_over = False
+        cs.winner_id = None
+        cs.player_connection_status.clear()
+        cs.phase = GamePhase.MAIN_1
+        cs.attackers.clear()
+        cs.pending_attackers.clear()
+        cs.selected_blocker = None
+        cs.pending_put_bottom_cards.clear()
+        cs.block_assignments.clear()
+        cs.animation_queue.clear()
+        cs.current_animation = None
+        cs.animation_timer = 0.0
+        cs.log_messages.clear()
+        # Очищаем очереди на случай, если там что-то осталось
+        while not self.incoming_queue.empty(): self.incoming_queue.get_nowait()
+        while not self.outgoing_queue.empty(): self.outgoing_queue.get_nowait()
+        while not self.discovery_queue.empty(): self.discovery_queue.get_nowait()
 
     def run(self):
         # Instantiate systems that might depend on each other
         render_system = RenderSystem(self.screen, self.client_state, self.ui_manager,
                                      self.font, self.medium_font, self.log_font,
                                      self.big_font, self.emoji_font)
-        ui_setup_system = UISetupSystem(self.client_state, self.ui_manager, self.font, self.medium_font)
-        input_system = InputSystem(self.outgoing_queue, self.client_state, self.ui_manager)
+        # Передаем колбэки для управления подключением
+        ui_setup_system = UISetupSystem(self.client_state, self.ui_manager, self.font, self.medium_font,
+                                        self.start_connection, self.reset_to_menu, self.disconnect_and_go_to_server_browser, self.chat_input)
+        input_system = InputSystem(self.outgoing_queue, self.client_state, self.ui_manager, self.chat_input)
 
         # Add systems to the world in the correct order for the game loop
         # State -> Layout -> UI Setup -> Input -> Animation -> Render
-        esper.add_processor(StateUpdateSystem(self.incoming_queue, self.font, self.client_state))
+        esper.add_processor(StateUpdateSystem(self.incoming_queue, self.discovery_queue, self.font, self.client_state))
         esper.add_processor(AnimationSystem(self.client_state))
         esper.add_processor(LayoutSystem(self.client_state))
         esper.add_processor(ui_setup_system)
         esper.add_processor(input_system)
         esper.add_processor(render_system)
 
-        self.network_thread.start()
-
-
         while self.running:
             delta_time = self.clock.tick(60) / 1000.0
+            self.chat_input.update(delta_time)
 
             # Check for exit signal
             if self.client_state.my_player_id == -999: # Сигнал выхода из InputSystem
                 self.running = False
                 continue
 
+            # NEW: Manage discovery thread based on game phase
+            if self.client_state.game_phase == 'SERVER_BROWSER' and (not self.discovery_thread or not self.discovery_thread.is_alive()):
+                # Запускаем поток поиска и засекаем время входа в этот режим
+                if self.client_state.server_browser_enter_time == 0.0:
+                    self.client_state.server_browser_enter_time = time.time()
+                self.start_discovery()
+            elif self.client_state.game_phase != 'SERVER_BROWSER' and self.discovery_thread and self.discovery_thread.is_alive():
+                # Сбрасываем таймер при выходе из режима поиска
+                self.client_state.server_browser_enter_time = 0.0
+                self.stop_discovery()
+
             esper.process(delta_time=delta_time)
         
         # Cleanup
-        self.outgoing_queue.put(None) # Signal network thread to close
-        self.network_thread.join(timeout=2)
+        self.stop_discovery() # NEW
+        if self.network_thread and self.network_thread.is_alive():
+            self.outgoing_queue.put(None) # Signal network thread to close
+            self.network_thread.join(timeout=2)
         pygame.quit()
         sys.exit()
 

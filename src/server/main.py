@@ -4,32 +4,35 @@
 --- РЕАЛИЗОВАНО ---
 - Асинхронный TCP-сервер на asyncio.
 - Поддержка двух игроков с переподключением.
+- Обнаружение сервера в локальной сети (UDP broadcast).
+- Лобби с системой готовности игроков и чатом.
 - Игровая логика на базе ECS (esper).
 - Базовые системы: розыгрыш карт, смена хода, атака, конец игры.
 - Правило "муллигана" (сброс стартовой руки) по правилам MTG.
 - Создание колод, стартовая рука, базовые типы карт (существа, земли, заклинания).
 - Сериализация и отправка состояния игры клиентам.
 - Обработка команд от клиентов.
-
 --- ПЛАН РАЗРАБОТКИ (TODO) ---
 - Более сложные механики карт (триггеры, пассивные способности).
 - Расширенная система фаз (Upkeep, End Step).
 - Загрузка колод из файлов.
-- Лобби и система подбора игроков.
 - Улучшенная валидация действий игроков на сервере.
+- Сохранение состояния игры между перезапусками сервера.
 """
 import asyncio
 import json
 import logging
 import random
+import socket
 from typing import Any
 import time
 import esper
 from src.common.components import (
     CardInfo, Player, Owner, InHand, OnBoard, PlayCardCommand, GameOver, SpellEffect, ActiveTurn, Graveyard,
     InGraveyard, EndTurnCommand, Deck, InDeck, Tapped, TapLandCommand, DeclareAttackersCommand,
-    Attacking, SummoningSickness, DeclareBlockersCommand,
-    MulliganCommand, KeepHandCommand, PutCardsBottomCommand, MulliganDecisionPhase, MulliganCount, GamePhaseComponent, KeptHand
+    Attacking, SummoningSickness, DeclareBlockersCommand, Disconnected, PlayerReadyCommand,
+    MulliganCommand, KeepHandCommand, PutCardsBottomCommand, MulliganDecisionPhase, MulliganCount, GamePhaseComponent, #
+    KeptHand
 )
 from src.server.systems import (PlayCardSystem, TurnManagementSystem, AttackSystem, GameOverSystem, TapLandSystem,
                                 MulliganSystem)
@@ -37,9 +40,12 @@ from src.server.systems import (PlayCardSystem, TurnManagementSystem, AttackSyst
 # --- Глобальное состояние ---
 # Глобальное состояние для сессий игроков. Позволяет обрабатывать переподключения.
 player_sessions = {
-    1: {"writer": None, "status": "DISCONNECTED", "addr": None},
-    2: {"writer": None, "status": "DISCONNECTED", "addr": None}
+    1: {"writer": None, "status": "DISCONNECTED", "addr": None, "ready": False},
+    2: {"writer": None, "status": "DISCONNECTED", "addr": None, "ready": False}
 }
+server_name = f"Cardnet Server {random.randint(1000, 9999)}"
+BROADCAST_PORT = 8889
+TCP_PORT = 8888
 # Очередь событий для отправки клиентам. Системы будут добавлять сюда события.
 event_queue = []
 
@@ -97,6 +103,12 @@ async def _handle_new_connection(writer: asyncio.StreamWriter, player_id: int, i
     player_sessions[player_id]["writer"] = writer
     player_sessions[player_id]["status"] = "CONNECTED"
     player_sessions[player_id]["addr"] = addr
+    player_sessions[player_id]["ready"] = False # Сбрасываем готовность при подключении
+
+    # Убираем маркер отключения из ECS
+    if esper.entity_exists(player_id) and esper.has_component(player_id, Disconnected):
+        esper.remove_component(player_id, Disconnected)
+
     logging.info(f"Client {addr} assigned to player ID {player_id}. Status: CONNECTED/RECONNECTED")
 
     # Если это было переподключение, уведомляем всех
@@ -106,10 +118,24 @@ async def _handle_new_connection(writer: asyncio.StreamWriter, player_id: int, i
     # --- Сообщаем клиенту его ID ---
     await send_to_one(writer, {"type": "ASSIGN_PLAYER_ID", "payload": {"player_id": player_id}})
 
-    # --- Отправка полного состояния новому клиенту ---
-    initial_state = serialize_game_state_for_player(player_id)
-    await send_to_one(writer, {"type": "FULL_STATE_UPDATE", "payload": initial_state})
-    logging.info(f"Sent full state snapshot to client {addr}")
+    # Если игра еще не началась (в лобби), просто уведомляем всех об обновлении лобби.
+    game_phase_comp = next(iter(esper.get_component(GamePhaseComponent)), None)
+    if game_phase_comp and game_phase_comp[1].phase == "LOBBY":
+        # Создаем сериализуемую версию сессий, исключая не-JSON объекты (StreamWriter)
+        serializable_sessions = {
+            p_id: {"status": s_data["status"], "ready": s_data.get("ready", False)} for p_id, s_data in player_sessions.items()
+        }
+        await broadcast({"type": "LOBBY_UPDATE", "payload": {"sessions": serializable_sessions}})
+        # Проверяем, оба ли игрока подключены и готовы, чтобы начать игру
+        if all(s["status"] == "CONNECTED" and s.get("ready", False) for s in player_sessions.values()):
+            logging.info("Both players ready. Starting new match.")
+            start_new_match()
+            # После начала матча нужна полная синхронизация
+            await broadcast_full_state()
+    else: # Игра уже идет, отправляем полное состояние только этому клиенту
+        initial_state = serialize_game_state_for_player(player_id)
+        await send_to_one(writer, {"type": "FULL_STATE_UPDATE", "payload": initial_state})
+        logging.info(f"Sent full state snapshot to reconnected client {addr}")
 
 
 async def _process_client_message(message_str: str, player_entity_id: int, writer: asyncio.StreamWriter):
@@ -136,8 +162,37 @@ async def _process_client_message(message_str: str, player_entity_id: int, write
             await send_to_one(writer, {"type": "ACTION_ERROR", "payload": {"message": "Сейчас не ваш ход."}})
             return
 
+    game_phase_comp = next(iter(esper.get_component(GamePhaseComponent)), None)
+    current_phase = game_phase_comp[1].phase if game_phase_comp else "UNKNOWN"
+
     # --- Диспетчеризация команд ---
-    if command_type == "PLAY_CARD":
+    if command_type == "CHAT_MESSAGE":
+        if current_phase == "LOBBY":
+            text = payload.get("text", "")
+            if text: # Не отправляем пустые сообщения
+                await broadcast({
+                    "type": "CHAT_MESSAGE",
+                    "payload": {
+                        "sender_id": player_entity_id,
+                        "text": text[:200] # Ограничиваем длину сообщения
+                    }
+                })
+    elif command_type == "PLAYER_READY":
+        if current_phase == "LOBBY" and player_entity_id in player_sessions:
+            if not player_sessions[player_entity_id]["ready"]:
+                player_sessions[player_entity_id]["ready"] = True
+                logging.info(f"Player {player_entity_id} is ready.")
+                # Уведомляем всех об изменении статуса
+                serializable_sessions = {
+                    p_id: {"status": s_data["status"], "ready": s_data.get("ready", False)} for p_id, s_data in player_sessions.items()
+                }
+                await broadcast({"type": "LOBBY_UPDATE", "payload": {"sessions": serializable_sessions}})
+                # Проверяем, можно ли начать игру
+                if all(s["status"] == "CONNECTED" and s.get("ready", False) for s in player_sessions.values()):
+                    logging.info("Both players ready. Starting new match.")
+                    start_new_match()
+                    await broadcast_full_state()
+    elif command_type == "PLAY_CARD":
         card_id = payload.get("card_entity_id")
         target_id = payload.get("target_id")
         if card_id is not None:
@@ -178,11 +233,15 @@ async def _handle_disconnection(writer: asyncio.StreamWriter):
         if session["writer"] == writer:
             session["status"] = "DISCONNECTED"
             session["writer"] = None
+            session["ready"] = False # Сбрасываем готовность при отключении
             disconnected_player_id = p_id
             break
 
     if disconnected_player_id:
         logging.info(f"Player {disconnected_player_id} ({addr}) marked as DISCONNECTED.")
+        # Добавляем компонент в ECS, чтобы игровые системы знали о статусе
+        if esper.entity_exists(disconnected_player_id):
+            esper.add_component(disconnected_player_id, Disconnected())
         await broadcast({"type": "PLAYER_DISCONNECTED", "payload": {"player_id": disconnected_player_id}})
     else:
         logging.warning(f"A client ({addr}) disconnected, but was not found in active sessions.")
@@ -275,14 +334,7 @@ async def game_loop():
                 # 2. Завершилась фаза, требующая анимации на клиенте (например, бой).
                 # 3. Игра закончилась.
                 if not is_informational_only and not is_phase_end and not game_has_ended:
-                    logging.debug("State changed, broadcasting tailored full state updates.")
-                    for player_id, session in player_sessions.items():
-                        if session["status"] == "CONNECTED" and session["writer"] is not None:
-                            tailored_state = serialize_game_state_for_player(player_id)
-                            await send_to_one(
-                                session["writer"],
-                                {"type": "FULL_STATE_UPDATE", "payload": tailored_state}
-                            )
+                    await broadcast_full_state()
                 else:
                     logging.debug(f"Skipping full state update (informational_only={is_informational_only}, is_phase_end={is_phase_end}, game_has_ended={game_has_ended}).")
 
@@ -297,9 +349,20 @@ async def game_loop():
             # Прерываем цикл, чтобы не спамить ошибками в консоль.
             break
 
-def setup_new_game():
+async def broadcast_full_state():
+    """Рассылает каждому игроку его версию состояния игры."""
+    logging.debug("Broadcasting tailored full state updates.")
+    for player_id, session in player_sessions.items():
+        if session["status"] == "CONNECTED" and session["writer"] is not None:
+            tailored_state = serialize_game_state_for_player(player_id)
+            await send_to_one(
+                session["writer"],
+                {"type": "FULL_STATE_UPDATE", "payload": tailored_state}
+            )
+
+def start_new_match():
     """Initializes or resets the game state for a new match."""
-    logging.info("--- SETTING UP NEW GAME ---")
+    logging.info("--- STARTING NEW MATCH ---")
     # Clear any existing entities and components
     esper.clear_database()
 
@@ -344,6 +407,13 @@ def setup_new_game():
         esper.add_component(p_ent, MulliganCount(count=0))
     logging.info("--- Starting Mulligan Phase ---")
 
+def reset_world():
+    """Сбрасывает мир в состояние лобби, готовое к новой игре."""
+    logging.info("--- Resetting world to LOBBY state ---")
+    esper.clear_database()
+    # Создаем единственный компонент, который говорит, что мы в лобби
+    esper.create_entity(GamePhaseComponent(phase="LOBBY"))
+
 def create_deck_for_player(player_entity_id: int) -> list[int]:
     """Создает набор карт для игрока и возвращает их ID."""
     deck_card_ids = []
@@ -380,6 +450,40 @@ def create_deck_for_player(player_entity_id: int) -> list[int]:
             deck_card_ids.append(card_id)
     return deck_card_ids
 
+async def udp_server_broadcast(tcp_port: int):
+    """Периодически рассылает информацию о сервере по UDP."""
+    # Создаем UDP сокет
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    # Включаем режим broadcast
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    # Устанавливаем таймаут, чтобы сокет не блокировал вечно
+    sock.settimeout(0.2)
+    # Адрес '<broadcast>' работает на всех платформах
+    broadcast_address = ('<broadcast>', BROADCAST_PORT)
+    
+    logging.info(f"Starting UDP broadcast on port {BROADCAST_PORT}")
+
+    while True:
+        try:
+            # Готовим сообщение
+            connected_players = sum(1 for s in player_sessions.values() if s['status'] == 'CONNECTED')
+            game_phase_comp = next(iter(esper.get_component(GamePhaseComponent)), None)
+            game_phase = game_phase_comp[1].phase if game_phase_comp else "UNKNOWN"
+
+            message = {
+                "server_name": server_name,
+                "players": f"{connected_players}/{len(player_sessions)}",
+                "status": game_phase,
+                "tcp_port": tcp_port
+            }
+            encoded_message = json.dumps(message).encode('utf-8')
+
+            sock.sendto(encoded_message, broadcast_address)
+            await asyncio.sleep(5)
+        except Exception as e:
+            logging.error(f"Error in UDP broadcast loop: {e}")
+            await asyncio.sleep(10)
+
 async def main():
     """Главная функция хоста."""
     # --- Настройка логирования ---
@@ -396,8 +500,8 @@ async def main():
     attack_system = AttackSystem(event_queue=event_queue)
     tap_land_system = TapLandSystem(event_queue=event_queue)
     turn_management_system = TurnManagementSystem(event_queue=event_queue)
-    # Передаем функцию `setup_new_game` в качестве колбэка для сброса
-    game_over_system = GameOverSystem(event_queue=event_queue, reset_callback=setup_new_game)
+    # Передаем функцию `reset_world` в качестве колбэка для сброса
+    game_over_system = GameOverSystem(event_queue=event_queue, reset_callback=reset_world)
     # Порядок важен. GameOverSystem должна идти первой, чтобы остановить игру.
     esper.add_processor(game_over_system)
     esper.add_processor(play_card_system)
@@ -407,17 +511,19 @@ async def main():
     # Добавляем систему муллигана
     esper.add_processor(MulliganSystem(event_queue=event_queue))
 
-    # Первоначальная настройка игры
-    setup_new_game()
+    # Первоначальная настройка мира в состояние лобби
+    reset_world()
 
     # --- Запуск сервера и игрового цикла ---
-    server = await asyncio.start_server(handle_client, '0.0.0.0', 8888)
+    server = await asyncio.start_server(handle_client, '0.0.0.0', TCP_PORT)
 
     addr = server.sockets[0].getsockname()
     logging.info(f'Server listening on {addr}')
 
     # Запускаем игровой цикл как фоновую задачу
     game_task = asyncio.create_task(game_loop())
+    # Запускаем UDP broadcast как фоновую задачу
+    broadcast_task = asyncio.create_task(udp_server_broadcast(TCP_PORT))
 
     async with server:
         await server.serve_forever()
@@ -500,7 +606,8 @@ def _serialize_players_and_distribute_cards(all_cards: dict) -> dict:
             "hand": [card_id for card_id, data in all_cards.items() if data["owner_id"] == player.player_id and data["location"] == "HAND"],
             "board": [card_id for card_id, data in all_cards.items() if data["owner_id"] == player.player_id and data["location"] == "BOARD"],
             "deck_size": len(esper.component_for_entity(player_ent, Deck).card_ids) if esper.has_component(player_ent, Deck) else 0,
-            "graveyard_size": len(esper.component_for_entity(player_ent, Graveyard).card_ids) if esper.has_component(player_ent, Graveyard) else 0
+            "graveyard_size": len(esper.component_for_entity(player_ent, Graveyard).card_ids) if esper.has_component(player_ent, Graveyard) else 0,
+            "is_connected": not esper.has_component(player_ent, Disconnected)
         }
         # NEW: Add mulligan state info
         if game_phase == "MULLIGAN":

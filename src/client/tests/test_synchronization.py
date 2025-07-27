@@ -22,8 +22,10 @@ class TestClientSynchronization(unittest.TestCase):
         self.mock_font.render.return_value = pygame.Surface((10, 10))
         self.client_state = ClientState()
         self.incoming_queue = queue.Queue()
+        self.discovery_queue = queue.Queue()
         self.state_update_system = StateUpdateSystem(
             incoming_q=self.incoming_queue,
+            discovery_q=self.discovery_queue,
             font=self.mock_font,
             client_state=self.client_state
         )

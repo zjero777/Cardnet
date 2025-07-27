@@ -64,6 +64,11 @@ class Tapped:
 class SummoningSickness:
     pass
 
+@dataclass
+class Disconnected:
+    """Marker component for a player that is currently disconnected."""
+    pass
+
 # --- Mulligan Phase Components & Commands ---
 @dataclass
 class MulliganCommand:
@@ -104,6 +109,11 @@ class GamePhaseComponent:
 @dataclass
 class Attacking:
     pass
+
+@dataclass
+class PlayerReadyCommand:
+    """Команда, отправляемая игроком, когда он готов начать игру в лобби."""
+    player_entity_id: int
 
 @dataclass
 class ActiveTurn:

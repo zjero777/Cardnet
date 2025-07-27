@@ -1,10 +1,11 @@
 import unittest
 from unittest.mock import Mock, patch
-import queue
 import pygame
+import queue
 import esper
 
-from src.client.main import InputSystem, ClientState, Position, Drawable, Clickable, CardSprite, UIManager, RenderSystem, GamePhase
+from src.client.main import InputSystem, ClientState, Position, Drawable, Clickable, CardSprite, UIManager, RenderSystem, GamePhase, TextInput
+from src.client.ui import MENU_BUTTON_TEXT
 
 class TestInputSystem(unittest.TestCase):
     def setUp(self):
@@ -23,16 +24,23 @@ class TestInputSystem(unittest.TestCase):
         self.patcher = patch('esper.get_processor', return_value=self.mock_render_system)
         self.mock_get_processor = self.patcher.start()
 
+        self.chat_input = TextInput(
+            rect=pygame.Rect(0, 0, 100, 30),
+            font=Mock(),
+            text_color=MENU_BUTTON_TEXT
+        )
         self.input_system = InputSystem(
             outgoing_q=self.outgoing_queue,
             client_state=self.client_state,
-            ui_manager=self.ui_manager
+            ui_manager=self.ui_manager,
+            chat_input_ref=self.chat_input
         )
         
         # Общая настройка состояния
         self.client_state.my_player_id = 1
         self.client_state.active_player_id = 1
         self.client_state.phase = GamePhase.MAIN_1
+        self.client_state.game_phase = "GAME_RUNNING"
         self.client_state.game_state_dict = {
             "players": {
                 "1": {"entity_id": 1, "hand": [], "board": []},

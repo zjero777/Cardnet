@@ -16,6 +16,12 @@ LABEL_COLOR = (200, 200, 255)
 TURN_INDICATOR_PLAYER_COLOR = (100, 200, 100)
 TURN_INDICATOR_OPPONENT_COLOR = (200, 100, 100)
 
+# --- Menu Button Colors (Indie Style) ---
+MENU_BUTTON_BG = (45, 64, 89)
+MENU_BUTTON_HOVER = (60, 85, 118)
+MENU_BUTTON_PRESSED = (30, 43, 59)
+MENU_BUTTON_TEXT = (234, 234, 234)
+
 
 class UIElement:
     """Базовый класс для всех элементов интерфейса."""
@@ -106,7 +112,10 @@ class UIManager:
         Обрабатывает одно событие. Возвращает True, если событие было обработано
         UI, иначе False.
         """
-        mouse_pos = pygame.mouse.get_pos()
+        if not hasattr(event, 'pos'):
+            return False # Not a mouse event we can process
+
+        mouse_pos = event.pos
         hovered_button = None
         for element in self.elements:
             if isinstance(element, Button) and element.rect.collidepoint(mouse_pos):
@@ -141,3 +150,43 @@ class UIManager:
                 element.is_hovered = (element.rect == hovered_rect)
                 element.is_pressed = (element.rect == self.active_rect and element.is_hovered)
             element.draw(screen)
+
+
+class TextInput(UIElement):
+    """Элемент для ввода текста."""
+    def __init__(self, rect: pygame.Rect, font: pygame.font.Font,
+                 text_color=BUTTON_TEXT_COLOR,
+                 bg_color=MENU_BUTTON_PRESSED,
+                 active_color=MENU_BUTTON_HOVER,
+                 max_len=50):
+        super().__init__(rect)
+        self.font = font
+        self.text_color = text_color
+        self.bg_color = bg_color
+        self.active_color = active_color
+        self.text = ""
+        self.is_active = False
+        self.cursor_visible = True
+        self.cursor_timer = 0.0
+        self.max_len = max_len
+
+    def draw(self, screen: pygame.Surface):
+        color = self.active_color if self.is_active else self.bg_color
+        pygame.draw.rect(screen, color, self.rect, border_radius=5)
+        pygame.draw.rect(screen, (150, 150, 150), self.rect, 1, border_radius=5)
+
+        text_surface = self.font.render(self.text, True, self.text_color)
+        screen.blit(text_surface, (self.rect.x + 10, self.rect.y + (self.rect.height - text_surface.get_height()) // 2))
+
+        if self.is_active and self.cursor_visible:
+            cursor_pos_x = self.rect.x + 10 + text_surface.get_width()
+            if cursor_pos_x > self.rect.right - 5:
+                cursor_pos_x = self.rect.right - 5
+            pygame.draw.line(screen, self.text_color, (cursor_pos_x, self.rect.top + 8), (cursor_pos_x, self.rect.bottom - 8), 1)
+
+    def update(self, delta_time: float):
+        if self.is_active:
+            self.cursor_timer += delta_time
+            if self.cursor_timer >= 0.5:
+                self.cursor_timer = 0
+                self.cursor_visible = not self.cursor_visible
