@@ -4,16 +4,27 @@ from typing import Optional, List, Dict
 # --- Game State Components ---
 
 @dataclass
+class ManaPool:
+    """Хранит ману разных цветов для игрока."""
+    W: int = 0  # White
+    U: int = 0  # Blue
+    B: int = 0  # Black
+    R: int = 0  # Red
+    G: int = 0  # Green
+    C: int = 0  # Colorless/Generic
+
+@dataclass
 class Player:
     player_id: int
     health: int = 30
-    mana_pool: int = 0
+    mana_pool: ManaPool = field(default_factory=ManaPool)
 
 @dataclass
 class CardInfo:
     name: str
-    cost: int
     card_type: str  # "MINION", "SPELL", "LAND"
+    cost: Dict[str, int] = field(default_factory=dict) # e.g. {'G': 1, 'generic': 2}
+    produces: Optional[str] = None # e.g. 'W', 'U', 'B', 'R', 'G'
     attack: Optional[int] = None
     health: Optional[int] = None
     max_health: Optional[int] = None
@@ -158,3 +169,7 @@ class DeclareAttackersCommand:
     """Команда, отправляемая для объявления всех атакующих за раз."""
     player_entity_id: int
     attacker_ids: list[int]
+    
+@dataclass
+class ReturnToLobbyCommand:
+    player_entity_id: int

@@ -28,7 +28,8 @@ import socket
 import sys
 import threading
 import queue
-from typing import Optional, Dict, Any, List
+import math
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
@@ -66,8 +67,39 @@ PLAYER_BOARD_Y = PLAYER_HAND_Y - CARD_HEIGHT - Y_MARGIN
 OPPONENT_HAND_Y = Y_MARGIN
 OPPONENT_BOARD_Y = OPPONENT_HAND_Y + CARD_HEIGHT + Y_MARGIN
 
+# --- Игровая зона для карт ---
+PLAY_AREA_X_START = 240 # Отступ слева для индикаторов, колоды и кладбища
+
+RIGHT_MARGIN = 40
+PLAY_AREA_WIDTH = SCREEN_WIDTH - PLAY_AREA_X_START - RIGHT_MARGIN
+
 # --- Константы ---
-CARD_BG_COLOR = (100, 100, 120)
+# --- Card Visuals ---
+ASSETS = {} # Словарь для хранения загруженных изображений
+CARD_BG_COLOR_TOP = (70, 80, 110)
+CARD_BG_COLOR_BOTTOM = (40, 50, 70)
+CARD_ART_BG_COLOR = (30, 35, 45)
+MANA_PENTAGON_SIZE = CARD_HEIGHT
+MANA_COLORS = {
+    'W': (248, 247, 216),  # White
+    'U': (174, 214, 241),  # Blue
+    'B': (171, 178, 185),  # Black
+    'R': (237, 187, 153),  # Red
+    'G': (169, 204, 164),  # Green
+}
+MANA_SECTOR_COLORS = { # Transparent colors for pentagon sectors
+    'W': (248, 247, 216, 150),
+    'U': (174, 214, 241, 150),
+    'B': (100, 100, 100, 150), # Darker black for visibility
+    'R': (237, 187, 153, 150),
+    'G': (169, 204, 164, 150),
+}
+MANA_SYMBOL_TEXT_COLOR = (10, 10, 10)
+STATS_BG_COLOR = (210, 210, 220) # Светлый фон для характеристик
+STATS_TEXT_COLOR = (10, 10, 20) # Темный текст для характеристик
+HEALTH_COLOR = (255, 220, 220)
+HEALTH_BG_COLOR = (60, 20, 20)
+
 CARD_HIGHLIGHT_COLOR = (255, 255, 0)
 CARD_SELECTION_COLOR = (70, 170, 255)  # Светло-голубой для выделения
 TARGET_COLOR = (255, 0, 0)
@@ -79,6 +111,25 @@ ATTACK_READY_COLOR = (0, 255, 0)
 
 # --- Компоненты (Components) ---
 BROADCAST_PORT = 8889
+
+def get_player_indicator_rect(client_state: "ClientState", player_id: int) -> Optional[pygame.Rect]:
+    """Возвращает Rect для индикатора игрока (пентагона)."""
+    if not client_state.game_state_dict or client_state.my_player_id is None:
+        return None
+
+    is_my_player = (player_id == client_state.my_player_id)
+    size = MANA_PENTAGON_SIZE
+    radius = size // 2
+
+    if is_my_player:
+        center_x = PORTRAIT_X + CARD_WIDTH // 2
+        center_y = PLAYER_BOARD_Y + CARD_HEIGHT // 2
+    else:
+        center_x = PORTRAIT_X + CARD_WIDTH // 2
+        center_y = OPPONENT_BOARD_Y + CARD_HEIGHT // 2
+
+    # Возвращаем квадратный Rect, описывающий пентагон
+    return pygame.Rect(center_x - radius, center_y - radius, size, size)
 
 
 class GamePhase(Enum):
@@ -136,6 +187,18 @@ class Clickable:
     """Marker component for entities that can be clicked."""
     pass
 
+@dataclass
+class Animation:
+    """Компонент для анимации движения сущности."""
+    start_pos: Tuple[float, float]
+    end_pos: Optional[Tuple[float, float]] = None
+    start_time: float = 0.0
+    duration: float = 0.4  # Длительность анимации в секундах
+    animation_type: str = "DRAW"
+    # NEW: Поля для анимации переворота
+    is_flipped: bool = False
+    current_scale_x: float = 1.0
+
 # --- Спрайт карты (Card Sprite) ---
 # This class is mostly the same, but now it's just a visual representation.
 class CardSprite(pygame.sprite.Sprite):
@@ -145,52 +208,140 @@ class CardSprite(pygame.sprite.Sprite):
         self.card_id = card_id
         self.card_data = card_data
         self.font = font
-        self.image = pygame.Surface([CARD_WIDTH, CARD_HEIGHT])
+        self.image = pygame.Surface([CARD_WIDTH, CARD_HEIGHT], pygame.SRCALPHA)
         self.rect = self.image.get_rect()
         self.update_visuals() # Initial draw with no highlights
 
+    def _draw_rounded_gradient(self, top_color, bottom_color, radius):
+        """Helper to draw a rounded gradient background on self.image."""
+        gradient_surf = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+        for y in range(CARD_HEIGHT):
+            r = top_color[0] + (bottom_color[0] - top_color[0]) * y / CARD_HEIGHT
+            g = top_color[1] + (bottom_color[1] - top_color[1]) * y / CARD_HEIGHT
+            b = top_color[2] + (bottom_color[2] - top_color[2]) * y / CARD_HEIGHT
+            pygame.draw.line(gradient_surf, (r, g, b), (0, y), (CARD_WIDTH, y))
+
+        mask = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+        pygame.draw.rect(mask, (255, 255, 255), mask.get_rect(), border_radius=radius)
+
+        gradient_surf.blit(mask, (0, 0), None, pygame.BLEND_RGBA_MIN)
+        self.image.blit(gradient_surf, (0, 0))
+
     def _draw_card_back(self):
         """Рисует рубашку карты."""
-        self.image.fill((139, 69, 19))  # SaddleBrown
-        pygame.draw.rect(self.image, (0, 0, 0), self.image.get_rect(), 5)
-        pygame.draw.circle(self.image, (218, 165, 32), self.image.get_rect().center, 30)  # Goldenrod
+        self._draw_rounded_gradient((20, 20, 80), (50, 50, 120), 8)
+
+        # Рамка и центральный символ
+        pygame.draw.rect(self.image, (0, 0, 0), self.image.get_rect(), 2, border_radius=8)
+        pygame.draw.circle(self.image, (218, 165, 32), self.image.get_rect().center, 30, 3)
+        pygame.draw.circle(self.image, (255, 255, 255), self.image.get_rect().center, 15)
+
+    def _draw_gradient_bg(self):
+        """Рисует вертикальный градиент на фоне карты в форме скругленного прямоугольника."""
+        self._draw_rounded_gradient(CARD_BG_COLOR_TOP, CARD_BG_COLOR_BOTTOM, 8)
+
+    def _draw_cost_icon(self, cost: Any):
+        """Рисует иконку стоимости в стиле MTG в правом верхнем углу."""
+        cost_dict = cost if isinstance(cost, dict) else {}
+        if not cost_dict:
+            return
+
+        mana_symbols_to_draw = []
+        # MTG convention: generic, then W, U, B, R, G
+        if 'generic' in cost_dict and cost_dict['generic'] > 0:
+            mana_symbols_to_draw.append(str(cost_dict['generic']))
+        for color in "WUBRG":
+            if color in cost_dict:
+                mana_symbols_to_draw.extend([color] * cost_dict[color])
+
+        icon_radius = 9
+        icon_diameter = icon_radius * 2
+        spacing = 2
+        x_pos = CARD_WIDTH - icon_radius - 5
+
+        for symbol in reversed(mana_symbols_to_draw):
+            pos = (x_pos, 15)
+            
+            is_generic = symbol.isdigit()
+            circle_color = (190, 190, 190) if is_generic else MANA_COLORS.get(symbol, (128, 128, 128))
+            
+            pygame.draw.circle(self.image, circle_color, pos, icon_radius)
+            pygame.draw.circle(self.image, (20, 20, 20), pos, icon_radius, 1) # Black border
+
+            cost_text = self.font.render(symbol, True, MANA_SYMBOL_TEXT_COLOR)
+            cost_rect = cost_text.get_rect(center=pos)
+            self.image.blit(cost_text, cost_rect)
+
+            x_pos -= icon_diameter + spacing
+
 
     def _draw_card_face(self):
         """Рисует лицевую сторону карты: фон, имя, стоимость и характеристики."""
-        self.image.fill(CARD_BG_COLOR)
-        pygame.draw.rect(self.image, (0, 0, 0), self.image.get_rect(), 2)
+        self._draw_gradient_bg()
+        pygame.draw.rect(self.image, (0, 0, 0), self.image.get_rect(), 2, border_radius=8)
 
         name = self.card_data.get('name', '???')
         cost = self.card_data.get('cost', '?')
         card_type = self.card_data.get('type')
 
+        # Имя карты
         name_text = self.font.render(name, True, FONT_COLOR)
-        cost_text = self.font.render(f"({cost})", True, FONT_COLOR)
-        self.image.blit(name_text, (5, 5))
-        self.image.blit(cost_text, (CARD_WIDTH - cost_text.get_width() - 5, 5))
+        self.image.blit(name_text, (10, 8))
 
+        # Иконка стоимости
+        self._draw_cost_icon(cost)
+
+        # Плейсхолдер для арта
+        art_rect = pygame.Rect(4, 30, CARD_WIDTH - 8, CARD_HEIGHT - 75)
+        pygame.draw.rect(self.image, CARD_ART_BG_COLOR, art_rect)
+
+        # Тип карты и характеристики
         if card_type == 'MINION':
             attack = self.card_data.get('attack', '?')
             health = self.card_data.get('health', '?')
-            stats_text = self.font.render(f"{attack}/{health}", True, FONT_COLOR)
-            self.image.blit(stats_text, (CARD_WIDTH - stats_text.get_width() - 5, CARD_HEIGHT - 25))
-        elif card_type == 'SPELL':
-            type_text = self.font.render("Spell", True, FONT_COLOR)
-            self.image.blit(type_text, (5, CARD_HEIGHT - 25))
+            # Отображаем атаку/здоровье в виде "1/1" на светлом фоне
+            stats_text_str = f"{attack}/{health}"
+            stats_text_surf = self.font.render(stats_text_str, True, STATS_TEXT_COLOR)
+
+            padding_x = 6
+            padding_y = 1
+            stats_bg_width = stats_text_surf.get_width() + 2 * padding_x
+            stats_bg_height = stats_text_surf.get_height() + 2 * padding_y
+
+            stats_bg_rect = pygame.Rect(
+                CARD_WIDTH - stats_bg_width - 5,
+                CARD_HEIGHT - stats_bg_height - 5,
+                stats_bg_width,
+                stats_bg_height
+            )
+            pygame.draw.rect(self.image, STATS_BG_COLOR, stats_bg_rect, border_radius=4)
+            text_rect = stats_text_surf.get_rect(center=stats_bg_rect.center)
+            self.image.blit(stats_text_surf, text_rect)
+        else:
+            type_text_str = "Заклинание" if card_type == "SPELL" else "Земля"
+            type_text = self.font.render(type_text_str, True, (200, 200, 200))
+            type_rect = type_text.get_rect(centerx=CARD_WIDTH / 2, y=CARD_HEIGHT - 25)
+            self.image.blit(type_text, type_rect)
 
     def _draw_status_overlays(self):
         """Рисует оверлеи и индикаторы статусов (болезнь вызова, поворот)."""
+        # Helper to draw a single rounded overlay
+        def draw_rounded_overlay(color):
+            overlay_surf = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
+            pygame.draw.rect(overlay_surf, color, overlay_surf.get_rect(), border_radius=8)
+            self.image.blit(overlay_surf, (0, 0))
+
+        # 1. Draw overlays first
         if self.card_data.get('has_sickness'):
-            sickness_overlay = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
-            sickness_overlay.fill((128, 128, 128, 100))  # Полупрозрачный серый
-            self.image.blit(sickness_overlay, (0, 0))
-            zzz_text = self.font.render("Zzz", True, (200, 200, 255))
-            self.image.blit(zzz_text, (5, CARD_HEIGHT - 45))
+            draw_rounded_overlay((128, 128, 128, 100))
 
         if self.card_data.get('is_tapped'):
-            tapped_overlay = pygame.Surface(self.image.get_size(), pygame.SRCALPHA)
-            tapped_overlay.fill((0, 0, 0, 100))  # Полупрозрачный черный
-            self.image.blit(tapped_overlay, (0, 0))
+            draw_rounded_overlay((0, 0, 0, 100))
+
+        # 2. Draw text and indicators on top of overlays
+        if self.card_data.get('has_sickness'):
+            zzz_text = self.font.render("Zzz", True, (200, 200, 255))
+            self.image.blit(zzz_text, (5, CARD_HEIGHT - 45))
 
         if self.card_data.get('can_attack', False):
             pygame.draw.circle(self.image, ATTACK_READY_COLOR, (15, CARD_HEIGHT - 15), 10)
@@ -205,9 +356,10 @@ class CardSprite(pygame.sprite.Sprite):
         if is_hovered:
             pygame.draw.rect(self.image, CARD_HIGHLIGHT_COLOR, self.image.get_rect(), 4)
 
-    def update_visuals(self, is_hovered: bool = False, is_selected: bool = False):
+    def update_visuals(self, is_hovered: bool = False, is_selected: bool = False, force_show_back: bool = False):
         """Перерисовывает внешний вид карты на основе ее данных."""
-        if self.card_data.get('is_hidden', False):
+        self.image.fill((0, 0, 0, 0)) # Очищаем с прозрачностью
+        if force_show_back or self.card_data.get('is_hidden', False):
             self._draw_card_back()
         else:
             self._draw_card_face()
@@ -259,11 +411,14 @@ class ServerDiscoveryThread(threading.Thread):
 
 class StateUpdateSystem(esper.Processor):
     """Processes messages from the server and updates the client's ECS world."""
-    def __init__(self, incoming_q: queue.Queue, discovery_q: queue.Queue, font: pygame.font.Font, client_state: ClientState):
+    def __init__(self, incoming_q: queue.Queue, discovery_q: queue.Queue, font: pygame.font.Font, client_state: ClientState, outgoing_q: queue.Queue, auto_mode: bool):
+        super().__init__()
         self.incoming_q = incoming_q
         self.discovery_q = discovery_q # new
         self.font = font
         self.client_state = client_state
+        self.outgoing_q = outgoing_q
+        self.auto_mode = auto_mode
         self.server_timeout = 15.0 # seconds
 
     def _add_log_message(self, message: str):
@@ -338,39 +493,63 @@ class StateUpdateSystem(esper.Processor):
                     self.client_state.game_phase = "LOBBY"
                     self.client_state.lobby_state = event.get("payload", {}).get("sessions", {})
 
+                    # NEW: Auto-ready logic
+                    if self.auto_mode and self.client_state.my_player_id is not None:
+                        my_id_str = str(self.client_state.my_player_id)
+                        my_session_data = self.client_state.lobby_state.get(my_id_str)
+                        if my_session_data and not my_session_data.get("ready", False):
+                            print("Auto-mode: Sending PLAYER_READY command.")
+                            self.outgoing_q.put({"type": "PLAYER_READY"})
+
                 elif event_type == "FULL_STATE_UPDATE":
+                    # --- Сохраняем ID выбранной карты до синхронизации ---
+                    old_selected_id = self.client_state.selected_entity
+
                     game_state_dict = event.get("payload", {})
                     self.client_state.game_state_dict = game_state_dict
                     self.client_state.active_player_id = game_state_dict.get("active_player_id")
-                    # If we get a state update, we must be connected.
                     self.client_state.network_status = "CONNECTED"
-                    # Полное обновление состояния синхронизирует мир, но не должно менять текущую фазу хода.
-                    # Фаза меняется только специальными событиями (TURN_STARTED, COMBAT_RESOLVED и т.д.),
                     
-                    # NEW: Update game phase
-                    new_phase = game_state_dict.get("game_phase", "UNKNOWN")
-                    if new_phase != self.client_state.game_phase:
-                        print(f"--- Game phase changed to: {new_phase} ---")
-                        self.client_state.game_phase = new_phase
+                    # The full state update is the single source of truth for the overall game phase.
+                    # We remove conditional updates to prevent race conditions where an event
+                    # might temporarily set the phase, only for it to be overwritten by a
+                    # slightly older state update. The FSU is always right.
+                    self.client_state.game_phase = game_state_dict.get("game_phase", "UNKNOWN")
+
+                    # If we are forced back into mulligan (e.g. on reconnect), clear the pending cards
+                    if self.client_state.game_phase == "MULLIGAN":
                         self.client_state.pending_put_bottom_cards.clear()
 
-                    # поэтому мы не сбрасываем self.client_state.phase здесь.
                     self.client_state.pending_attackers.clear()
                     self.client_state.game_over = False
                     self.client_state.winner_id = None
 
-                    # Сбрасываем выбор, так как все сущности будут пересозданы
                     self.client_state.selected_entity = None
                     self.client_state.selected_blocker = None
 
-                    # Инициализируем статусы подключения.
-                    # Все игроки в состоянии считаются подключенными, если их статус еще не известен.
                     for player_id_str in game_state_dict.get("players", {}).keys():
                         player_id = int(player_id_str)
                         if player_id not in self.client_state.player_connection_status:
                             self.client_state.player_connection_status[player_id] = "CONNECTED"
 
                     self._synchronize_world(game_state_dict)
+
+                    # --- Восстанавливаем выбор, если сущность все еще существует ---
+                    # Это предотвращает сброс выбора карты (например, заклинания с целью)
+                    # при каждом обновлении состояния от сервера.
+                    if old_selected_id is not None and esper.entity_exists(old_selected_id):
+                        # Проверяем, что это все еще карта, которую можно выбирать (в руке, требует цели)
+                        all_cards = self.client_state.game_state_dict.get("cards", {})
+                        card_data = all_cards.get(str(old_selected_id))
+                        if card_data and card_data.get("location") == "HAND":
+                            effect = card_data.get("effect", {})
+                            if effect.get("requires_target"):
+                                self.client_state.selected_entity = old_selected_id
+
+                elif event_type == "GAME_STARTED":
+                    # This event is now just a signal for potential animations or sounds.
+                    # The actual state change is handled by FULL_STATE_UPDATE.
+                    self._add_log_message("Игра началась!")
 
                 elif event_type == "GAME_OVER":
                     payload = event.get("payload", {})
@@ -500,10 +679,25 @@ class StateUpdateSystem(esper.Processor):
                         self._add_log_message(f"{player_name} разыгрывает '{card_name}'.")
 
                 elif event_type == "CARD_DIED":
-                    card_id = event['payload'].get('card_id')
+                    payload = event.get("payload", {})
+                    card_id = payload.get('card_id')
+                    owner_id = payload.get('owner_id')
+                    card_data = payload.get('card_data')
+
                     self.client_state.animation_queue.append(event)
                     card_name = self._get_entity_name(card_id)
                     self._add_log_message(f"'{card_name}' уничтожена.")
+
+                    # Immediately update local state for graveyard
+                    if self.client_state.game_state_dict and owner_id is not None and card_id is not None:
+                        all_cards = self.client_state.game_state_dict.get("cards", {})
+                        player_data = self.client_state.game_state_dict.get("players", {}).get(str(owner_id))
+                        if player_data:
+                            player_data["graveyard_size"] = player_data.get("graveyard_size", 0) + 1
+                            player_data["graveyard_top_card_id"] = card_id
+                        # Обновляем данные карты сброшенным состоянием с сервера
+                        if card_data:
+                            all_cards[str(card_id)] = card_data
                 elif event_type == "CHAT_MESSAGE":
                     payload = event.get("payload", {})
                     sender_id = payload.get("sender_id")
@@ -515,9 +709,55 @@ class StateUpdateSystem(esper.Processor):
                     self.client_state.chat_messages.append({"sender": sender_name, "text": text})
                     if len(self.client_state.chat_messages) > self.client_state.max_chat_messages:
                         self.client_state.chat_messages.pop(0)
+
+                elif event_type == "CARD_DRAWN":
+                    payload = event.get("payload", {})
+                    player_id = payload.get("player_id")
+                    card_id = payload.get("card_id")
+                    card_data = payload.get("card_data")
+
+                    if player_id is None or card_id is None or card_data is None:
+                        continue
+
+                    # Добавляем карту в локальное состояние, чтобы другие системы ее увидели
+                    if self.client_state.game_state_dict:
+                        self.client_state.game_state_dict.setdefault("cards", {})[str(card_id)] = card_data
+                        player_data = self.client_state.game_state_dict.get("players", {}).get(str(player_id))
+                        if player_data:
+                            if "hand" not in player_data: player_data["hand"] = []
+                            if card_id not in player_data["hand"]: player_data["hand"].append(card_id)
+                    
+                    # Создаем анимацию для любого игрока
+                    if not esper.entity_exists(card_id):
+                        print(f"WARNING: Card {card_id} drawn but does not exist on client. Skipping animation.")
+                        continue
+
+                    card_sprite = CardSprite(card_id, card_data, self.font)
+                    if not esper.has_component(card_id, Drawable): esper.add_component(card_id, Drawable(card_sprite))
+                    if not esper.has_component(card_id, Clickable): esper.add_component(card_id, Clickable())
+
+                    is_my_player = (player_id == self.client_state.my_player_id)
+                    indicator_rect = get_player_indicator_rect(self.client_state, player_id)
+                    if indicator_rect:
+                        graveyard_card_right_edge = indicator_rect.centerx + CARD_WIDTH // 2
+                        deck_x = graveyard_card_right_edge + CARD_SPACING_X
+                        if is_my_player:
+                            deck_y = indicator_rect.bottom + Y_MARGIN
+                        else:
+                            deck_y = indicator_rect.top - Y_MARGIN - CARD_HEIGHT
+                    else: # Fallback
+                        if is_my_player:
+                            deck_x = SCREEN_WIDTH - CARD_WIDTH - PORTRAIT_X
+                            deck_y = PLAYER_BOARD_Y
+                        else:
+                            deck_x = SCREEN_WIDTH - CARD_WIDTH - PORTRAIT_X
+                            deck_y = OPPONENT_BOARD_Y
+                    start_pos = (deck_x, deck_y)
+
+                    if not esper.has_component(card_id, Position): esper.add_component(card_id, Position(start_pos[0], start_pos[1]))
+                    esper.add_component(card_id, Animation(start_pos=start_pos, start_time=time.time()))
         except queue.Empty:
             pass
-
 
     def _synchronize_world(self, state: Dict[str, Any]):
         """Re-creates the client world based on server state."""
@@ -579,10 +819,9 @@ class LayoutSystem(esper.Processor):
 
         if not client_state.game_state_dict: return
 
-        # Определяем константы для ограничения ширины зон
-        BOARD_WIDTH_LIMIT = SCREEN_WIDTH - 2 * (PORTRAIT_X + CARD_WIDTH) - 40  # Пространство между портретами
-        HAND_WIDTH_LIMIT = SCREEN_WIDTH - 40 # Почти вся ширина экрана
-        
+        BOARD_WIDTH_LIMIT = PLAY_AREA_WIDTH
+        HAND_WIDTH_LIMIT = PLAY_AREA_WIDTH
+
         my_id = client_state.my_player_id
         if my_id is None: return
 
@@ -604,18 +843,26 @@ class LayoutSystem(esper.Processor):
             # Рассчитываем требуемую ширину без наложения
             full_width = num_cards * CARD_WIDTH + (num_cards - 1) * CARD_SPACING_X
             
-            spacing = CARD_WIDTH + CARD_SPACING_X
+            spacing = CARD_WIDTH + CARD_SPACING_X #
             
             # Если карты не помещаются, рассчитываем новое расстояние с наложением
             if full_width > width_limit and num_cards > 1:
                 spacing = (width_limit - CARD_WIDTH) / (num_cards - 1)
 
             total_width = (num_cards - 1) * spacing + CARD_WIDTH
-            start_x = (SCREEN_WIDTH - total_width) / 2
+            start_x = PLAY_AREA_X_START + (PLAY_AREA_WIDTH - total_width) / 2
             for i, card_id in enumerate(drawable_card_ids):
                 pos = esper.component_for_entity(card_id, Position)
-                pos.x = start_x + i * spacing
-                pos.y = y_pos
+                end_x = start_x + i * spacing
+                end_y = y_pos
+
+                if esper.has_component(card_id, Animation):
+                    animation = esper.component_for_entity(card_id, Animation)
+                    if animation.animation_type == "DRAW" and animation.end_pos is None:
+                        animation.end_pos = (end_x, end_y)
+                        continue # Не меняем позицию напрямую, пусть это делает AnimationSystem
+                
+                pos.x, pos.y = end_x, end_y
 
         if my_player_data:
             arrange_cards(my_player_data.get("hand", []), PLAYER_HAND_Y, HAND_WIDTH_LIMIT)
@@ -625,6 +872,18 @@ class LayoutSystem(esper.Processor):
             arrange_cards(opp_player_data.get("board", []), OPPONENT_BOARD_Y, BOARD_WIDTH_LIMIT)
             arrange_cards(opp_player_data.get("hand", []), OPPONENT_HAND_Y, HAND_WIDTH_LIMIT)
 
+class SyncSpriteRectSystem(esper.Processor):
+    """
+    Обновляет атрибут `rect` всех спрайтов карт, чтобы он соответствовал их
+    компоненту `Position`. Это критически важно для корректной работы
+    обнаружения столкновений (кликов).
+    """
+    def process(self, *args, **kwargs):
+        for ent, (drawable, pos) in esper.get_components(Drawable, Position):
+            # Атрибут rect спрайта используется для обнаружения столкновений,
+            # поэтому он должен быть синхронизирован с логической позицией сущности.
+            drawable.sprite.rect.topleft = (pos.x, pos.y)
+
 class AnimationSystem(esper.Processor):
     """Processes and times animations for combat and other events."""
     def __init__(self, client_state: ClientState):
@@ -632,6 +891,33 @@ class AnimationSystem(esper.Processor):
         self.animation_duration = 0.6  # seconds per animation step
 
     def process(self, *args, **kwargs):
+        # --- Новая логика для анимации движения ---
+        for ent, (anim, pos) in esper.get_components(Animation, Position):
+            if anim.animation_type == "DRAW":
+                if anim.end_pos is None:
+                    # Ждем, пока LayoutSystem не определит конечную позицию
+                    continue
+
+                now = time.time()
+                elapsed = now - anim.start_time
+                progress = min(1.0, elapsed / anim.duration)
+
+                # Плавная интерполяция (ease-out)
+                progress = 1 - (1 - progress) ** 3
+
+                start_x, start_y = anim.start_pos
+                end_x, end_y = anim.end_pos
+                pos.x = start_x + (end_x - start_x) * progress
+                pos.y = start_y + (end_y - start_y) * progress
+
+                # NEW: Update scale and flip status for flip effect
+                # abs(1 - 2*x) gives a value that goes 1 -> 0 -> 1 as x goes 0 -> 1
+                anim.current_scale_x = abs(1.0 - 2 * progress)
+                anim.is_flipped = (progress >= 0.5)
+
+                if progress >= 1.0:
+                    esper.remove_component(ent, Animation)
+
         client_state = self.client_state
         delta_time = kwargs.get("delta_time", 1/60.0)
 
@@ -807,14 +1093,23 @@ class UISetupSystem(esper.Processor):
         my_mulligan_state = my_player_data.get("mulligan_state", "NONE")
         input_system = esper.get_processor(InputSystem)
 
-        center_x, center_y = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
+        center_x = PLAY_AREA_X_START + PLAY_AREA_WIDTH // 2
+        center_y = (OPPONENT_BOARD_Y + CARD_HEIGHT + PLAYER_BOARD_Y) // 2
 
         if my_mulligan_state == "DECIDING":
             # Показываем кнопки "Оставить" и "Муллиган"
-            keep_button = Button("Keep Hand", pygame.Rect(center_x - 220, center_y - 25, 200, 50), self.font,
-                                 lambda: input_system.outgoing_q.put({"type": "KEEP_HAND"}))
-            mulligan_button = Button("Mulligan", pygame.Rect(center_x + 20, center_y - 25, 200, 50), self.font,
-                                     lambda: input_system.outgoing_q.put({"type": "MULLIGAN"}))
+            keep_button = Button(
+                "Keep Hand", pygame.Rect(center_x - 220, center_y - 25, 200, 50), self.font,
+                lambda: input_system.outgoing_q.put({"type": "KEEP_HAND"}),
+                bg_color=MENU_BUTTON_BG, hover_color=MENU_BUTTON_HOVER,
+                pressed_color=MENU_BUTTON_PRESSED, text_color=MENU_BUTTON_TEXT
+            )
+            mulligan_button = Button(
+                "Mulligan", pygame.Rect(center_x + 20, center_y - 25, 200, 50), self.font,
+                lambda: input_system.outgoing_q.put({"type": "MULLIGAN"}),
+                bg_color=MENU_BUTTON_BG, hover_color=MENU_BUTTON_HOVER,
+                pressed_color=MENU_BUTTON_PRESSED, text_color=MENU_BUTTON_TEXT
+            )
             self.ui_manager.add_element(keep_button)
             self.ui_manager.add_element(mulligan_button)
 
@@ -837,7 +1132,11 @@ class UISetupSystem(esper.Processor):
                     # Сразу очищаем выбор на клиенте для отзывчивости интерфейса.
                     client_state.pending_put_bottom_cards.clear()
 
-                confirm_button = Button("Confirm", pygame.Rect(center_x - 100, center_y, 200, 50), self.font, confirm_callback)
+                confirm_button = Button(
+                    "Confirm", pygame.Rect(center_x - 100, center_y, 200, 50), self.font, confirm_callback,
+                    bg_color=CONFIRM_BUTTON_COLOR, hover_color=CONFIRM_BUTTON_HOVER_COLOR,
+                    pressed_color=CONFIRM_BUTTON_PRESSED_COLOR, text_color=CONFIRM_BUTTON_TEXT_COLOR
+                )
                 self.ui_manager.add_element(confirm_button)
 
         elif my_mulligan_state == "WAITING":
@@ -878,7 +1177,9 @@ class UISetupSystem(esper.Processor):
 
         # 3. Отображаем кнопки действий в зависимости от фазы
         input_system = esper.get_processor(InputSystem)
-        button_rect = pygame.Rect(SCREEN_WIDTH // 2 - 125, vertical_center_y - 25, 250, 50)
+        play_area_center_x = PLAY_AREA_X_START + PLAY_AREA_WIDTH // 2
+        button_width = 250
+        button_rect = pygame.Rect(play_area_center_x - button_width // 2, vertical_center_y - 25, button_width, 50)
 
         # Кнопка для защищающегося игрока
         if not is_my_turn and client_state.phase == GamePhase.COMBAT_DECLARE_BLOCKERS:
@@ -887,6 +1188,12 @@ class UISetupSystem(esper.Processor):
                     "type": "DECLARE_BLOCKERS",
                     "payload": {"blocks": client_state.block_assignments}
                 })
+                # Сразу меняем состояние, чтобы кнопка исчезла и не отправлялись
+                # повторные команды. Клиент будет ждать ответа от сервера.
+                client_state.phase = GamePhase.COMBAT_AWAITING_CONFIRMATION
+                # Также очищаем выбранного блокера, чтобы линия таргетинга
+                # немедленно исчезла.
+                client_state.selected_blocker = None
             confirm_button = Button(
                 "Подтвердить блоки", button_rect, self.font, confirm_blocks_callback,
                 bg_color=CONFIRM_BUTTON_COLOR,
@@ -977,10 +1284,12 @@ class InputSystem(esper.Processor):
                     client_state.my_player_id = -999 # Сигнал для выхода
                 continue # Не обрабатываем другие события
 
-            # Если игра окончена, игнорируем все остальные события ввода
+            # Если игра окончена, ждем клика для возврата в лобби
             if client_state.game_over:
-                continue
-            
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    self.outgoing_q.put({"type": "RETURN_TO_LOBBY"})
+                continue # Игнорируем все остальные события
+
             # Обработка ввода для чата в лобби
             if client_state.game_phase == "LOBBY":
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -1047,21 +1356,17 @@ class InputSystem(esper.Processor):
                 self._handle_blocking_click(pos, client_state)
             return  # Не мой ход, больше ничего не делаем
 
-        # --- Find what was clicked (card or portrait) ---
-        clicked_card_entity = None
-        for ent, (drawable, position) in esper.get_components(Drawable, Position):
-            if drawable.sprite.rect.collidepoint(pos):
-                clicked_card_entity = ent
-                break
+        # --- Find what was clicked (card or player indicator) ---
+        # We use the hovered_entity which is correctly calculated by _handle_mouse_motion to respect card overlapping.
+        clicked_card_entity = client_state.hovered_entity
 
         clicked_player_entity = None
         # Only check for portrait if no card was clicked, to avoid overlap issues
         if not clicked_card_entity:
             opp_id_str = next((pid for pid in client_state.game_state_dict["players"] if int(pid) != client_state.my_player_id), None)
             if opp_id_str:
-                render_system = esper.get_processor(RenderSystem)
-                opp_portrait_rect = render_system._get_player_portrait_rect(int(opp_id_str))
-                if opp_portrait_rect and opp_portrait_rect.collidepoint(pos):
+                opp_indicator_rect = get_player_indicator_rect(client_state, int(opp_id_str))
+                if opp_indicator_rect and opp_indicator_rect.collidepoint(pos):
                     clicked_player_entity = client_state.game_state_dict["players"][opp_id_str].get("entity_id")
 
         # --- Handle spell targeting (if a spell is selected) ---
@@ -1200,17 +1505,125 @@ class RenderSystem(esper.Processor):
     """Draws all entities and UI elements."""
     def __init__(self, screen: pygame.Surface, client_state: ClientState, ui_manager: UIManager,
                  font: pygame.font.Font, medium_font: pygame.font.Font, log_font: pygame.font.Font,
-                 big_font: pygame.font.Font, emoji_font: pygame.font.Font):
+                 big_font: pygame.font.Font, emoji_font: pygame.font.Font, health_font: pygame.font.Font):
         self.screen = screen
         self.client_state = client_state
         self.ui_manager = ui_manager
         self.font = font # Regular font
         self.medium_font = medium_font
         self.log_font = log_font
+        self.health_font = health_font
         self.big_font = big_font
         self.emoji_font = emoji_font
         # Сделаем шрифт для заголовка крупнее
         self.title_font = self.big_font
+
+    def _draw_game_board(self):
+        """Отрисовывает все элементы игрового поля: карты, портреты, лог и т.д."""
+        client_state = self.client_state
+        hovered_card_to_draw_details = None
+        hovered_entity_id = client_state.hovered_entity
+
+        # --- Собираем все рисуемые карты ---
+        all_drawable_cards = []
+        for ent, (drawable, pos) in esper.get_components(Drawable, Position):
+            all_drawable_cards.append((ent, drawable, pos))
+
+        # --- Сортируем карты по X-координате (слева направо) ---
+        all_drawable_cards.sort(key=lambda item: item[2].x)
+
+        # --- Рисуем не-наведенные карты ---
+        for ent, drawable, pos in reversed(all_drawable_cards):
+            drawable.sprite.card_data['is_pending_put_bottom'] = (client_state.game_phase == "MULLIGAN" and ent in client_state.pending_put_bottom_cards)
+
+            if ent == hovered_entity_id:
+                hovered_card_to_draw_details = (ent, drawable, pos)
+                continue
+
+            is_selected = (ent == client_state.selected_entity or
+                           ent in client_state.pending_put_bottom_cards or
+                           ent == client_state.selected_blocker or
+                           (client_state.phase == GamePhase.COMBAT_DECLARE_ATTACKERS and ent in client_state.pending_attackers))
+
+            force_show_back, scale_x = False, 1.0
+            if esper.has_component(ent, Animation):
+                anim = esper.component_for_entity(ent, Animation)
+                if anim.animation_type == "DRAW":
+                    force_show_back = not anim.is_flipped
+                    scale_x = anim.current_scale_x
+            
+            drawable.sprite.update_visuals(is_hovered=False, is_selected=is_selected, force_show_back=force_show_back)
+            
+            scaled_width = int(CARD_WIDTH * scale_x)
+            if scaled_width > 0:
+                scaled_image = pygame.transform.scale(drawable.sprite.image, (scaled_width, CARD_HEIGHT))
+                scaled_rect = scaled_image.get_rect(center=(pos.x + CARD_WIDTH / 2, pos.y + CARD_HEIGHT / 2))
+                self.screen.blit(scaled_image, scaled_rect)
+
+        # --- Рисуем наведенную карту поверх всех ---
+        if hovered_card_to_draw_details:
+            ent, drawable, pos = hovered_card_to_draw_details
+            is_selected = (ent == client_state.selected_entity or
+                           ent in client_state.pending_put_bottom_cards or
+                           ent == client_state.selected_blocker or
+                           (client_state.phase == GamePhase.COMBAT_DECLARE_ATTACKERS and ent in client_state.pending_attackers))
+
+            force_show_back, scale_x = False, 1.0
+            if esper.has_component(ent, Animation):
+                anim = esper.component_for_entity(ent, Animation)
+                if anim.animation_type == "DRAW":
+                    force_show_back = not anim.is_flipped
+                    scale_x = anim.current_scale_x
+            
+            drawable.sprite.update_visuals(is_hovered=True, is_selected=is_selected, force_show_back=force_show_back)
+
+            scaled_width = int(CARD_WIDTH * scale_x)
+            if scaled_width > 0:
+                scaled_image = pygame.transform.scale(drawable.sprite.image, (scaled_width, CARD_HEIGHT))
+                scaled_rect = scaled_image.get_rect(center=(pos.x + CARD_WIDTH / 2, pos.y + CARD_HEIGHT / 2 - 20))
+                self.screen.blit(scaled_image, scaled_rect)
+
+        if client_state.selected_entity is not None and esper.has_component(client_state.selected_entity, Position):
+            selected_pos = esper.component_for_entity(client_state.selected_entity, Position)
+            start_pos = (selected_pos.x + CARD_WIDTH / 2, selected_pos.y + CARD_HEIGHT / 2)
+            end_pos = pygame.mouse.get_pos()
+            pygame.draw.line(self.screen, TARGET_COLOR, start_pos, end_pos, 3)
+
+        if client_state.selected_blocker is not None and esper.has_component(client_state.selected_blocker, Position):
+            selected_pos = esper.component_for_entity(client_state.selected_blocker, Position)
+            start_pos = (selected_pos.x + CARD_WIDTH / 2, selected_pos.y + CARD_HEIGHT / 2)
+            end_pos = pygame.mouse.get_pos()
+            pygame.draw.line(self.screen, (0, 0, 255), start_pos, end_pos, 3)
+
+        for blocker_id, attacker_id in client_state.block_assignments.items():
+            if esper.has_component(blocker_id, Position) and esper.has_component(attacker_id, Position):
+                blocker_pos = esper.component_for_entity(blocker_id, Position)
+                attacker_pos = esper.component_for_entity(attacker_id, Position)
+                start_pos = (blocker_pos.x + CARD_WIDTH / 2, blocker_pos.y + CARD_HEIGHT / 2)
+                end_pos = (attacker_pos.x + CARD_WIDTH / 2, attacker_pos.y + CARD_HEIGHT / 2)
+                pygame.draw.line(self.screen, (0, 255, 255), start_pos, end_pos, 5)
+
+        if client_state.phase == GamePhase.COMBAT_DECLARE_BLOCKERS:
+            overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 100, 64))
+            self.screen.blit(overlay, (0, 0))
+
+        if client_state.game_state_dict:
+            my_player_data = client_state.game_state_dict.get("players", {}).get(str(client_state.my_player_id))
+            if my_player_data:
+                self._draw_mana_pentagon(client_state.my_player_id)
+                self._draw_deck_pile(client_state.my_player_id)
+                self._draw_graveyard_pile(client_state.my_player_id)
+            opp_id_str = next((pid for pid in client_state.game_state_dict.get("players", {}) if int(pid) != client_state.my_player_id), None)
+            if opp_id_str:
+                self._draw_mana_pentagon(int(opp_id_str))
+                self._draw_deck_pile(int(opp_id_str))
+                self._draw_graveyard_pile(int(opp_id_str))
+
+        self._draw_log(client_state)
+        self._draw_connection_status_overlay(client_state)
+        if client_state.current_animation:
+            self._draw_animation(client_state.current_animation)
 
     def process(self, *args, **kwargs):
         client_state = self.client_state
@@ -1231,105 +1644,8 @@ class RenderSystem(esper.Processor):
             self._draw_lobby_screen(client_state)
         elif client_state.game_over:
             self._draw_game_over_screen(client_state)
-        else:
-            hovered_card_to_draw = None
-            hovered_entity_id = client_state.hovered_entity
-
-            # --- Собираем все рисуемые карты ---
-            all_drawable_cards = []
-            for ent, (drawable, pos) in esper.get_components(Drawable, Position):
-                all_drawable_cards.append((ent, drawable, pos))
-
-            # --- Сортируем карты по X-координате (слева направо) ---
-            all_drawable_cards.sort(key=lambda item: item[2].x)
-
-            # --- Рисуем карты в обратном порядке (справа налево) ---
-            # Это гарантирует, что левые карты будут нарисованы поверх правых,
-            # и правая часть карт (со статистикой) останется видимой.
-            # Вы были правы: важен именно порядок вывода, а не сортировки.
-            for ent, drawable, pos in reversed(all_drawable_cards):
-                # Добавляем флаг для отрисовки рамки муллигана
-                drawable.sprite.card_data['is_pending_put_bottom'] = (client_state.game_phase == "MULLIGAN" and ent in client_state.pending_put_bottom_cards)
-
-                # Если это карта под курсором, откладываем ее отрисовку
-                if ent == hovered_entity_id:
-                    hovered_card_to_draw = (drawable, pos)
-                    continue
-
-                is_selected = (ent == client_state.selected_entity or
-                               ent in client_state.pending_put_bottom_cards or
-                               ent == client_state.selected_blocker or
-                               (client_state.phase == GamePhase.COMBAT_DECLARE_ATTACKERS and ent in client_state.pending_attackers))
-
-                drawable.sprite.update_visuals(is_hovered=False, is_selected=is_selected)
-                drawable.sprite.rect.center = (pos.x + CARD_WIDTH / 2, pos.y + CARD_HEIGHT / 2)
-                self.screen.blit(drawable.sprite.image, drawable.sprite.rect)
-
-            # Рисуем карту под курсором последней, чтобы она была поверх всех, и со смещением
-            if hovered_card_to_draw:
-                drawable, pos = hovered_card_to_draw
-                # Проверяем, выбрана ли карта под курсором, чтобы передать оба состояния
-                is_selected = (hovered_entity_id == client_state.selected_entity or
-                               hovered_entity_id in client_state.pending_put_bottom_cards or
-                               hovered_entity_id == client_state.selected_blocker or
-                               (client_state.phase == GamePhase.COMBAT_DECLARE_ATTACKERS and hovered_entity_id in client_state.pending_attackers))
-                drawable.sprite.update_visuals(is_hovered=True, is_selected=is_selected)
-                # Создаем временный Rect для отрисовки со смещением, чтобы не менять исходный Rect спрайта
-                # и избежать "прыгания" карты.
-                temp_rect = drawable.sprite.rect.copy()
-                temp_rect.center = (pos.x + CARD_WIDTH / 2, pos.y + CARD_HEIGHT / 2 - 20) # Приподнимаем карту
-                self.screen.blit(drawable.sprite.image, temp_rect)
-
-            # Draw targeting line for ATTACKING
-            if client_state.selected_entity is not None and esper.has_component(client_state.selected_entity, Position):
-                selected_pos = esper.component_for_entity(client_state.selected_entity, Position)
-                start_pos = (selected_pos.x + CARD_WIDTH / 2, selected_pos.y + CARD_HEIGHT / 2)
-                end_pos = pygame.mouse.get_pos()
-                pygame.draw.line(self.screen, TARGET_COLOR, start_pos, end_pos, 3)
-
-            # Draw targeting line for BLOCKING
-            if client_state.selected_blocker is not None and esper.has_component(client_state.selected_blocker, Position):
-                selected_pos = esper.component_for_entity(client_state.selected_blocker, Position)
-                start_pos = (selected_pos.x + CARD_WIDTH / 2, selected_pos.y + CARD_HEIGHT / 2)
-                end_pos = pygame.mouse.get_pos()
-                pygame.draw.line(self.screen, (0, 0, 255), start_pos, end_pos, 3) # Blue line for blocking
-
-            # Draw assigned block lines
-            for blocker_id, attacker_id in client_state.block_assignments.items():
-                if esper.has_component(blocker_id, Position) and esper.has_component(attacker_id, Position):
-                    blocker_pos = esper.component_for_entity(blocker_id, Position)
-                    attacker_pos = esper.component_for_entity(attacker_id, Position)
-                    start_pos = (blocker_pos.x + CARD_WIDTH / 2, blocker_pos.y + CARD_HEIGHT / 2)
-                    end_pos = (attacker_pos.x + CARD_WIDTH / 2, attacker_pos.y + CARD_HEIGHT / 2)
-                    pygame.draw.line(self.screen, (0, 255, 255), start_pos, end_pos, 5) # Cyan line for confirmed blocks
-
-            # Draw phase overlay if needed
-            if client_state.phase == GamePhase.COMBAT_DECLARE_BLOCKERS:
-                overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-                overlay.fill((0, 0, 100, 64)) # Semi-transparent blue
-                self.screen.blit(overlay, (0, 0))
-
-            # Draw Player Info (Portraits) - это статичный UI, который рисуется каждый кадр
-            if client_state.game_state_dict:
-                my_player_data = client_state.game_state_dict.get("players", {}).get(str(client_state.my_player_id))
-                if my_player_data:
-                    self._draw_player_info(client_state.my_player_id)
-
-                opp_id_str = next((pid for pid in client_state.game_state_dict.get("players", {}) if int(pid) != client_state.my_player_id), None)
-                if opp_id_str:
-                    self._draw_player_info(int(opp_id_str))
-
-            # Draw Event Log
-            self._draw_log(client_state)
-
-            # Рисуем оверлей поверх всего, если оппонент отключился
-            self._draw_connection_status_overlay(client_state)
-            
-            if client_state.current_animation:
-                self._draw_animation(client_state.current_animation)
-
-            # Draw all UI elements managed by the UIManager
-            self.ui_manager.draw(self.screen)
+        elif client_state.game_phase in ["MULLIGAN", "GAME_RUNNING"]:
+            self._draw_game_board()
 
         # UI рисуется поверх всего, даже на экранах сообщений
         self.ui_manager.draw(self.screen)
@@ -1433,6 +1749,11 @@ class RenderSystem(esper.Processor):
         text_rect = text_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
         self.screen.blit(text_surf, text_rect)
 
+        # Добавляем подсказку для продолжения
+        continue_text = self.font.render("Нажмите, чтобы вернуться в лобби", True, (200, 200, 200))
+        continue_rect = continue_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 80))
+        self.screen.blit(continue_text, continue_rect)
+
     def _draw_message_screen(self, text: str, color: tuple, font: Optional[pygame.font.Font] = None):
         """Вспомогательная функция для отрисовки центрированного сообщения на экране."""
         font_to_use = font or self.medium_font
@@ -1467,29 +1788,33 @@ class RenderSystem(esper.Processor):
             draw_damage_flash(attacker_id)
             draw_damage_flash(target_id)
 
-            if esper.entity_exists(attacker_id) and esper.entity_exists(target_id):
-                attacker_pos = esper.component_for_entity(attacker_id, Position)
-                target_pos = esper.component_for_entity(target_id, Position)
+            # Animate the clash only if both combatants are still on the board.
+            # A combatant might have died and been removed before this animation runs.
+            if (esper.entity_exists(attacker_id) and esper.has_component(attacker_id, Position) and
+                    esper.entity_exists(target_id) and esper.has_component(target_id, Position)):
 
-                start_pos = (attacker_pos.x + CARD_WIDTH / 2, attacker_pos.y + CARD_HEIGHT / 2)
-                end_pos = (target_pos.x + CARD_WIDTH / 2, target_pos.y + CARD_HEIGHT / 2)
-                pygame.draw.line(self.screen, (255, 100, 0), start_pos, end_pos, 7)
+                    attacker_pos = esper.component_for_entity(attacker_id, Position)
+                    target_pos = esper.component_for_entity(target_id, Position)
 
-                clash_text = self.emoji_font.render("💥", True, (255, 255, 0))
-                clash_rect = clash_text.get_rect(center=((start_pos[0] + end_pos[0]) / 2, (start_pos[1] + end_pos[1]) / 2))
-                self.screen.blit(clash_text, clash_rect)
+                    start_pos = (attacker_pos.x + CARD_WIDTH / 2, attacker_pos.y + CARD_HEIGHT / 2)
+                    end_pos = (target_pos.x + CARD_WIDTH / 2, target_pos.y + CARD_HEIGHT / 2)
+                    pygame.draw.line(self.screen, (255, 100, 0), start_pos, end_pos, 7)
+
+                    clash_text = self.emoji_font.render("💥", True, (255, 255, 0))
+                    clash_rect = clash_text.get_rect(center=((start_pos[0] + end_pos[0]) / 2, (start_pos[1] + end_pos[1]) / 2))
+                    self.screen.blit(clash_text, clash_rect)
 
         elif event_type == "PLAYER_DAMAGED":
             player_id = payload.get("player_id")
-            portrait_rect = self._get_player_portrait_rect(player_id)
-            if portrait_rect:
-                overlay = pygame.Surface(portrait_rect.size, pygame.SRCALPHA)
+            indicator_rect = get_player_indicator_rect(self.client_state, player_id)
+            if indicator_rect:
+                overlay = pygame.Surface(indicator_rect.size, pygame.SRCALPHA)
                 overlay.fill((255, 0, 0, 128))
-                self.screen.blit(overlay, portrait_rect.topleft)
+                self.screen.blit(overlay, indicator_rect.topleft)
 
         elif event_type == "CARD_DIED":
             card_id = payload.get("card_id")
-            # The entity still exists during this animation. It will be deleted by AnimationSystem when the timer expires.
+            # The entity still exists during this animation. It will be made invisible by AnimationSystem when the timer expires.
             if esper.entity_exists(card_id) and esper.has_component(card_id, Position):
                 card_pos = esper.component_for_entity(card_id, Position)
                 skull_text = self.emoji_font.render("💀", True, (200, 200, 200))
@@ -1533,42 +1858,179 @@ class RenderSystem(esper.Processor):
 
         self.screen.blit(log_surface, log_rect.topleft)
 
-    def _get_player_portrait_rect(self, player_id: int) -> Optional[pygame.Rect]:
-        """Возвращает Rect для портрета игрока."""
+    def _draw_graveyard_pile(self, player_id: int):
+        """Рисует стопку кладбища и верхнюю карту."""
         client_state = self.client_state
-        if not client_state.game_state_dict or client_state.my_player_id is None:
-            return None
+        player_data = client_state.game_state_dict.get("players", {}).get(str(player_id))
+        if not player_data:
+            return
+
+        graveyard_size = player_data.get("graveyard_size", 0)
+        if graveyard_size <= 0:
+            return
+
         is_my_player = (player_id == client_state.my_player_id)
-        y_pos = PLAYER_BOARD_Y if is_my_player else OPPONENT_BOARD_Y
-        return pygame.Rect(PORTRAIT_X, y_pos, CARD_WIDTH, CARD_HEIGHT)
+        
+        indicator_rect = get_player_indicator_rect(client_state, player_id)
+        if not indicator_rect: return
+        
+        # Position it under/above the mana pentagon
+        graveyard_x = indicator_rect.centerx
+        if is_my_player:
+            graveyard_y = indicator_rect.bottom + Y_MARGIN
+        else:
+            graveyard_y = indicator_rect.top - Y_MARGIN
 
-    def _draw_player_info(self, player_id: int):
-        """Рисует портрет и информацию для указанного игрока."""
-        player_data = self.client_state.game_state_dict.get("players", {}).get(str(player_id))
-        if not player_data: return
-        portrait_rect = self._get_player_portrait_rect(player_id)
-        if not portrait_rect: return
+        # Draw the top card if it exists
+        top_card_id = player_data.get("graveyard_top_card_id")
+        if top_card_id is not None:
+            card_data = client_state.game_state_dict.get("cards", {}).get(str(top_card_id))
+            if card_data:
+                card_sprite = CardSprite(top_card_id, card_data, self.font)
+                card_sprite.update_visuals()
+                
+                if is_my_player:
+                    card_rect = card_sprite.image.get_rect(centerx=graveyard_x, top=graveyard_y)
+                else:
+                    card_rect = card_sprite.image.get_rect(centerx=graveyard_x, bottom=graveyard_y)
+                
+                # Draw a small pile effect underneath
+                for i in range(min(graveyard_size - 1, 3), 0, -1):
+                    offset = i * 2
+                    y_offset = -offset if is_my_player else offset
+                    pile_rect = card_rect.move(-offset, y_offset)
+                    pygame.draw.rect(self.screen, (20, 20, 25), pile_rect, 0, border_radius=8)
+                    pygame.draw.rect(self.screen, (80, 80, 90), pile_rect, 1, border_radius=8)
 
-        # Background and border
-        pygame.draw.rect(self.screen, (30, 30, 40), portrait_rect)
-        pygame.draw.rect(self.screen, (200, 200, 200), portrait_rect, 2)
+                self.screen.blit(card_sprite.image, card_rect)
 
-        # Player info text (multiline)
+    def _draw_deck_pile(self, player_id: int):
+        """Рисует стопку колоды для игрока."""
+        client_state = self.client_state
+        player_data = client_state.game_state_dict.get("players", {}).get(str(player_id))
+        if not player_data:
+            return
+
+        deck_size = player_data.get('deck_size', 0)
+        if deck_size <= 0:
+            return
+
+        is_my_player = (player_id == client_state.my_player_id)
+        
+        indicator_rect = get_player_indicator_rect(client_state, player_id)
+        if not indicator_rect: return
+
+        graveyard_card_right_edge = indicator_rect.centerx + CARD_WIDTH // 2
+        deck_x = graveyard_card_right_edge + CARD_SPACING_X
+
+        if is_my_player:
+            deck_y = indicator_rect.bottom + Y_MARGIN
+        else:
+            deck_y = indicator_rect.top - Y_MARGIN - CARD_HEIGHT
+
+        deck_rect = pygame.Rect(deck_x, deck_y, CARD_WIDTH, CARD_HEIGHT)
+
+        # Рисуем простую стопку карт
+        pygame.draw.rect(self.screen, (40, 40, 50), deck_rect.move(4, 4), border_radius=8)
+        pygame.draw.rect(self.screen, (50, 50, 60), deck_rect.move(2, 2), border_radius=8)
+        pygame.draw.rect(self.screen, (60, 60, 70), deck_rect, border_radius=8)
+        pygame.draw.rect(self.screen, (20, 20, 25), deck_rect, 2, border_radius=8)
+
+        # Рисуем количество карт
+        count_surf = self.medium_font.render(str(deck_size), True, FONT_COLOR)
+        self.screen.blit(count_surf, count_surf.get_rect(center=deck_rect.center))
+
+    def _draw_mana_pentagon(self, player_id: int):
+        """Рисует индикатор маны и здоровья в виде пятиугольника."""
+        client_state = self.client_state
+        player_data = client_state.game_state_dict.get("players", {}).get(str(player_id))
+        if not player_data:
+            return
+
+        is_my_player = (player_id == client_state.my_player_id)
+
+        size = MANA_PENTAGON_SIZE
+        radius = size // 2
+
+        if is_my_player:
+            center_x = PORTRAIT_X + CARD_WIDTH // 2
+            center_y = PLAYER_BOARD_Y + CARD_HEIGHT // 2
+        else:
+            center_x = PORTRAIT_X + CARD_WIDTH // 2
+            center_y = OPPONENT_BOARD_Y + CARD_HEIGHT // 2
+
+        # Get health and mana
         health = player_data.get('health', '?')
-        mana_pool = player_data.get('mana_pool', '?')
-        deck_size = player_data.get('deck_size', '?')
-        graveyard_size = player_data.get('graveyard_size', '?')
+        mana_pool_dict = player_data.get('mana_pool', {})
 
-        health_surf = self.font.render(f"Health: {health}", True, FONT_COLOR)
-        mana_surf = self.font.render(f"Mana: {mana_pool}", True, FONT_COLOR)
-        deck_surf = self.font.render(f"Deck: {deck_size}", True, FONT_COLOR)
-        graveyard_surf = self.font.render(f"Grave: {graveyard_size}", True, FONT_COLOR)
+        # --- Calculate vertices and midpoints ---
+        center_point = (center_x, center_y)
+        vertices = []
+        for i in range(5):
+            angle_rad = math.radians(-90 + 72 * i)
+            vx = center_x + radius * math.cos(angle_rad)
+            vy = center_y + radius * math.sin(angle_rad)
+            vertices.append((vx, vy))
 
-        # Position them vertically inside the portrait
-        self.screen.blit(health_surf, (portrait_rect.x + 10, portrait_rect.y + 15))
-        self.screen.blit(mana_surf, (portrait_rect.x + 10, portrait_rect.y + 40))
-        self.screen.blit(deck_surf, (portrait_rect.x + 10, portrait_rect.y + 65))
-        self.screen.blit(graveyard_surf, (portrait_rect.x + 10, portrait_rect.y + 90))
+        midpoints = []
+        for i in range(5):
+            p1 = vertices[i]
+            p2 = vertices[(i + 1) % 5]
+            midpoints.append(((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2))
+
+        # --- Draw sectors ---
+        mana_order = ['W', 'U', 'B', 'R', 'G']
+        for i in range(5):
+            color_char = mana_order[i]
+            midpoint_prev = midpoints[(i - 1 + 5) % 5]
+            vertex_current = vertices[i]
+            midpoint_current = midpoints[i]
+            sector_points = [center_point, midpoint_prev, vertex_current, midpoint_current]
+            sector_color = MANA_SECTOR_COLORS[color_char]
+            pygame.draw.polygon(self.screen, sector_color, sector_points)
+
+        # --- Draw pentagon outline and dividers ---
+        pygame.draw.polygon(self.screen, (200, 200, 220), vertices, 2)
+        for midpoint in midpoints:
+            pygame.draw.line(self.screen, (200, 200, 220, 150), center_point, midpoint, 1)
+
+        # --- Draw mana symbols and counts ---
+        symbol_radius_factor = 0.72  # Further from center
+        count_radius_factor = 0.45  # Closer to center
+        mana_angles = [-90, -18, 54, 126, 198] # Angles for W, U, B, R, G
+
+        for i, color_char in enumerate(mana_order):
+            mana_value = mana_pool_dict.get(color_char, 0)
+            angle_rad = math.radians(mana_angles[i])
+
+            # Position for symbol (further from center, towards the edge)
+            symbol_x = center_x + radius * symbol_radius_factor * math.cos(angle_rad)
+            symbol_y = center_y + radius * symbol_radius_factor * math.sin(angle_rad)
+            pygame.draw.circle(self.screen, MANA_COLORS[color_char], (symbol_x, symbol_y), 12)
+            pygame.draw.circle(self.screen, (20, 20, 20), (symbol_x, symbol_y), 12, 1)
+            symbol_surf = self.font.render(color_char, True, MANA_SYMBOL_TEXT_COLOR)
+            self.screen.blit(symbol_surf, symbol_surf.get_rect(center=(symbol_x, symbol_y)))
+
+            # Position for count (closer to center than the symbol)
+            count_x = center_x + radius * count_radius_factor * math.cos(angle_rad)
+            count_y = center_y + radius * count_radius_factor * math.sin(angle_rad)
+            
+            # Draw count with outline
+            count_text = str(mana_value)
+            outline_color = (20, 20, 30)
+            text_color = FONT_COLOR
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                outline_surf = self.font.render(count_text, True, outline_color)
+                self.screen.blit(outline_surf, outline_surf.get_rect(center=(count_x + dx, count_y + dy)))
+            count_surf = self.font.render(count_text, True, text_color)
+            self.screen.blit(count_surf, count_surf.get_rect(center=(count_x, count_y)))
+
+        # --- Draw health in the center ---
+        health_circle_radius = radius * 0.3
+        pygame.draw.circle(self.screen, HEALTH_BG_COLOR, center_point, health_circle_radius)
+        pygame.draw.circle(self.screen, (255, 255, 255), center_point, health_circle_radius, 2)
+        health_surf = self.health_font.render(str(health), True, HEALTH_COLOR)
+        self.screen.blit(health_surf, health_surf.get_rect(center=center_point))
 
 # --- Сетевой поток (Network Thread) ---
 # This class remains largely the same as it's a good pattern.
@@ -1621,16 +2083,28 @@ class NetworkThread(threading.Thread):
         asyncio.set_event_loop(self.loop)
         self.loop.run_until_complete(self.main_async())
 
+def load_assets():
+    """Загружает все игровые ассеты (изображения, звуки) в словарь ASSETS."""
+    try:
+        ASSETS['mana_icon'] = pygame.transform.smoothscale(pygame.image.load('assets/mana_icon.png').convert_alpha(), (24, 24))
+        ASSETS['attack_icon'] = pygame.transform.smoothscale(pygame.image.load('assets/attack_icon.png').convert_alpha(), (24, 24))
+        ASSETS['health_icon'] = pygame.transform.smoothscale(pygame.image.load('assets/health_icon.png').convert_alpha(), (24, 24))
+        print("Assets loaded successfully.")
+    except pygame.error as e:
+        print(f"Error loading assets: {e}. Make sure 'assets' folder with icons exists.")
+
 # --- Основной класс клиента (Main Client Class) ---
 class PygameClient:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, auto: bool = False):
         pygame.init()
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        load_assets() # Загружаем ассеты при инициализации
         pygame.display.set_caption("Cardnet ECS Client")
         # --- Fonts ---
         self.font = pygame.font.Font(None, 24)
         self.medium_font = pygame.font.Font(None, 50)
         self.log_font = pygame.font.Font(None, 18)
+        self.health_font = pygame.font.Font(None, 40)
         self.big_font = pygame.font.Font(None, 100)
         try:
             # Этот шрифт стандартен для Windows и поддерживает эмодзи.
@@ -1651,6 +2125,10 @@ class PygameClient:
         self.port = port
         self.network_thread = None # Будет создан при подключении
         self.discovery_thread = None
+        self.auto_mode = auto
+        if self.auto_mode:
+            self.start_connection(self.host, self.port)
+
         self.chat_input = TextInput(
             rect=pygame.Rect(200, SCREEN_HEIGHT - 45, SCREEN_WIDTH - 400, 35),
             font=self.font,
@@ -1756,17 +2234,18 @@ class PygameClient:
         # Instantiate systems that might depend on each other
         render_system = RenderSystem(self.screen, self.client_state, self.ui_manager,
                                      self.font, self.medium_font, self.log_font,
-                                     self.big_font, self.emoji_font)
+                                     self.big_font, self.emoji_font, self.health_font)
         # Передаем колбэки для управления подключением
         ui_setup_system = UISetupSystem(self.client_state, self.ui_manager, self.font, self.medium_font,
                                         self.start_connection, self.reset_to_menu, self.disconnect_and_go_to_server_browser, self.chat_input)
         input_system = InputSystem(self.outgoing_queue, self.client_state, self.ui_manager, self.chat_input)
 
-        # Add systems to the world in the correct order for the game loop
-        # State -> Layout -> UI Setup -> Input -> Animation -> Render
-        esper.add_processor(StateUpdateSystem(self.incoming_queue, self.discovery_queue, self.font, self.client_state))
+        # Add systems to the world in the correct order for the game loop.
+        # State -> Animation -> Layout -> Sync Rect -> UI Setup -> Input -> Render
+        esper.add_processor(StateUpdateSystem(self.incoming_queue, self.discovery_queue, self.font, self.client_state, self.outgoing_queue, self.auto_mode))
         esper.add_processor(AnimationSystem(self.client_state))
         esper.add_processor(LayoutSystem(self.client_state))
+        esper.add_processor(SyncSpriteRectSystem())
         esper.add_processor(ui_setup_system)
         esper.add_processor(input_system)
         esper.add_processor(render_system)
@@ -1807,7 +2286,9 @@ if __name__ == "__main__":
                         help='IP-адрес сервера для подключения (по умолчанию: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=8888,
                         help='Порт сервера для подключения (по умолчанию: 8888)')
+    parser.add_argument('--auto', action='store_true',
+                        help='Автоматически подключиться и подтвердить готовность.')
     args = parser.parse_args()
 
-    client = PygameClient(host=args.host, port=args.port)
+    client = PygameClient(host=args.host, port=args.port, auto=args.auto)
     client.run()

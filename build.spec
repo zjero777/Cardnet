@@ -12,7 +12,9 @@ a = Analysis(
     # Это нужно, чтобы PyInstaller правильно понял импорты вида `from src.client...`
     pathex=['d:\\Docs\\prj\\Cardnet'],
     binaries=[],
-    datas=[],
+    # Ключевое исправление №3: Добавляем папку с ассетами.
+    # Первый элемент - путь к папке в проекте, второй - имя папки в сборке.
+    datas=[('assets', 'assets')],
     # Ключевое исправление №2: Явно указываем "скрытые" импорты.
     # Это решает проблему 'ModuleNotFoundError: No module named 'pygame''.
     hiddenimports=[

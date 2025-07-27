@@ -23,14 +23,15 @@ import asyncio
 import json
 import logging
 import random
+import dataclasses
 import socket
 from typing import Any
 import time
 import esper
 from src.common.components import (
-    CardInfo, Player, Owner, InHand, OnBoard, PlayCardCommand, GameOver, SpellEffect, ActiveTurn, Graveyard,
+    CardInfo, Player, Owner, InHand, OnBoard, PlayCardCommand, GameOver, SpellEffect, ActiveTurn, Graveyard, ManaPool,
     InGraveyard, EndTurnCommand, Deck, InDeck, Tapped, TapLandCommand, DeclareAttackersCommand,
-    Attacking, SummoningSickness, DeclareBlockersCommand, Disconnected, PlayerReadyCommand,
+    Attacking, SummoningSickness, DeclareBlockersCommand, Disconnected, PlayerReadyCommand, ReturnToLobbyCommand,
     MulliganCommand, KeepHandCommand, PutCardsBottomCommand, MulliganDecisionPhase, MulliganCount, GamePhaseComponent, #
     KeptHand
 )
@@ -219,6 +220,16 @@ async def _process_client_message(message_str: str, player_entity_id: int, write
         card_ids = payload.get("card_ids", [])
         if isinstance(card_ids, list):
             esper.create_entity(PutCardsBottomCommand(player_entity_id=player_entity_id, card_ids=card_ids))
+    elif command_type == "RETURN_TO_LOBBY":
+        # Разрешаем это действие, только если игра действительно окончена
+        if esper.get_component(GameOver):
+            logging.info(f"Player {player_entity_id} initiated return to lobby.")
+            reset_world()
+            # После сброса мир находится в состоянии ЛОББИ. Уведомляем клиентов.
+            serializable_sessions = {
+                p_id: {"status": s_data["status"], "ready": s_data.get("ready", False)} for p_id, s_data in player_sessions.items()
+            }
+            await broadcast({"type": "LOBBY_UPDATE", "payload": {"sessions": serializable_sessions}})
     else:
         logging.warning(f"Received unknown command type '{command_type}' from {addr}, treating as chat.")
         response = {"type": "chat", "from": str(addr), "payload": message_str}
@@ -311,16 +322,24 @@ async def game_loop():
                 # таким образом, чтобы требовалась полная синхронизация.
                 informational_event_types = {"ACTION_ERROR"}
 
-                # Определяем события, которые сигнализируют о завершении основной фазы, после которой
-                # мы хотим отложить обновление состояния, чтобы дать клиенту время на анимацию.
-                phase_end_event_types = {"COMBAT_RESOLVED", "BLOCKERS_PHASE_STARTED"}
+                # Определяем события, которые требуют анимации на клиенте. Отправка полного
+                # состояния сразу после таких событий может привести к тому, что анимация
+                # не будет показана, так как мир клиента будет немедленно перестроен.
+                delay_fsu_event_types = {
+                    "COMBAT_RESOLVED", 
+                    "BLOCKERS_PHASE_STARTED",
+                    "CARD_ATTACKED",
+                    "PLAYER_DAMAGED",
+                    "CARD_DIED"
+                }
 
                 # Определяем характер событий в очереди
                 is_informational_only = all(
                     event.get("type") in informational_event_types for event in events_to_send
                 )
-                is_phase_end = any(
-                    event.get("type") in phase_end_event_types for event in events_to_send
+                # Переименовываем для ясности
+                should_delay_fsu = any(
+                    event.get("type") in delay_fsu_event_types for event in events_to_send
                 )
                 game_has_ended = any(event.get("type") == "GAME_OVER" for event in events_to_send)
 
@@ -328,15 +347,12 @@ async def game_loop():
                     logging.debug(f"Broadcasting event: {event}")
                     await broadcast(event)
 
-                # Решаем, отправлять ли полное обновление состояния. Мы отправляем его, только если
-                # состояние действительно изменилось, и не в случаях, когда:
-                # 1. Произошли только информационные события (например, ошибка действия).
-                # 2. Завершилась фаза, требующая анимации на клиенте (например, бой).
-                # 3. Игра закончилась.
-                if not is_informational_only and not is_phase_end and not game_has_ended:
+                # Отправляем полное обновление состояния, только если в очереди не было событий,
+                # требующих анимации на клиенте.
+                if not is_informational_only and not should_delay_fsu and not game_has_ended:
                     await broadcast_full_state()
                 else:
-                    logging.debug(f"Skipping full state update (informational_only={is_informational_only}, is_phase_end={is_phase_end}, game_has_ended={game_has_ended}).")
+                    logging.debug(f"Skipping full state update (informational_only={is_informational_only}, should_delay_fsu={should_delay_fsu}, game_has_ended={game_has_ended}).")
 
             # Динамическая задержка для поддержания стабильного тикрейта
             loop_end_time = time.monotonic()
@@ -410,19 +426,30 @@ def start_new_match():
 def reset_world():
     """Сбрасывает мир в состояние лобби, готовое к новой игре."""
     logging.info("--- Resetting world to LOBBY state ---")
+
+    # Сбрасываем состояние GameOverSystem, чтобы она могла снова сработать
+    game_over_system = esper.get_processor(GameOverSystem)
+    if game_over_system:
+        game_over_system.reset()
+
     esper.clear_database()
     # Создаем единственный компонент, который говорит, что мы в лобби
     esper.create_entity(GamePhaseComponent(phase="LOBBY"))
+    # Сбрасываем готовность для всех игроков
+    for session in player_sessions.values():
+        session["ready"] = False
 
 def create_deck_for_player(player_entity_id: int) -> list[int]:
     """Создает набор карт для игрока и возвращает их ID."""
     deck_card_ids = []
     # Добавим заклинание "Огненный шар"
+    # Колода теперь в цветах Red/White
     card_templates = [
-        {"name": "Plains", "cost": 0, "count": 15, "card_type": "LAND"},
-        {"name": "Goblin", "cost": 1, "attack": 1, "health": 1, "count": 8, "card_type": "MINION"},
-        {"name": "Knight", "cost": 3, "attack": 3, "health": 3, "count": 4, "card_type": "MINION"},
-        {"name": "Fireball", "cost": 4, "count": 3, "card_type": "SPELL", "effect": {"type": "DEAL_DAMAGE", "value": 6, "requires_target": True}}
+        {"name": "Plains", "cost": {}, "count": 8, "card_type": "LAND", "produces": "W"},
+        {"name": "Mountain", "cost": {}, "count": 7, "card_type": "LAND", "produces": "R"},
+        {"name": "Goblin", "cost": {'R': 1}, "attack": 1, "health": 1, "count": 8, "card_type": "MINION"},
+        {"name": "Knight", "cost": {'W': 1, 'generic': 1}, "attack": 2, "health": 2, "count": 4, "card_type": "MINION"},
+        {"name": "Fireball", "cost": {'R': 1, 'generic': 3}, "count": 3, "card_type": "SPELL", "effect": {"type": "DEAL_DAMAGE", "value": 4, "requires_target": True}}
     ]
     for template in card_templates:
         for _ in range(template['count']):
@@ -433,7 +460,7 @@ def create_deck_for_player(player_entity_id: int) -> list[int]:
                 InDeck()
             ]
             if template['card_type'] == "LAND":
-                pass  # У земель нет доп. компонентов по умолчанию
+                card_components[0].produces = template['produces']
             elif template['card_type'] == "MINION":
                 card_components[0].attack = template['attack']
                 card_components[0].health = template['health']
@@ -500,8 +527,7 @@ async def main():
     attack_system = AttackSystem(event_queue=event_queue)
     tap_land_system = TapLandSystem(event_queue=event_queue)
     turn_management_system = TurnManagementSystem(event_queue=event_queue)
-    # Передаем функцию `reset_world` в качестве колбэка для сброса
-    game_over_system = GameOverSystem(event_queue=event_queue, reset_callback=reset_world)
+    game_over_system = GameOverSystem(event_queue=event_queue)
     # Порядок важен. GameOverSystem должна идти первой, чтобы остановить игру.
     esper.add_processor(game_over_system)
     esper.add_processor(play_card_system)
@@ -539,7 +565,7 @@ def _get_card_location(card_ent: int) -> str:
     if esper.has_component(card_ent, InGraveyard): return "GRAVEYARD"
     return "UNKNOWN"
 
-def _serialize_visible_card(card_ent: int, card_info: CardInfo) -> dict:
+def _serialize_visible_card(card_ent: int, card_info: CardInfo, location: str) -> dict:
     """Сериализует данные видимой карты."""
     card_data = {
         "name": card_info.name,
@@ -553,7 +579,9 @@ def _serialize_visible_card(card_ent: int, card_info: CardInfo) -> dict:
         card_data["attack"] = card_info.attack
         card_data["health"] = card_info.health
         card_data["max_health"] = card_info.max_health
-        card_data["can_attack"] = not card_data["is_tapped"] and not card_data["has_sickness"]
+        # Существо может атаковать, только если оно на столе, не повернуто и не имеет болезни вызова.
+        card_data["can_attack"] = (location == "BOARD" and
+                               not card_data["is_tapped"] and not card_data["has_sickness"])
     elif card_info.card_type == "SPELL" and esper.has_component(card_ent, SpellEffect):
         effect = esper.component_for_entity(card_ent, SpellEffect)
         card_data["effect"] = {
@@ -580,7 +608,7 @@ def _serialize_card(card_ent: int, card_info: CardInfo, owner: Owner, viewing_pl
         card_data["is_hidden"] = True
     else:
         # Объединяем базовые данные с данными видимой карты
-        card_data.update(_serialize_visible_card(card_ent, card_info))
+        card_data.update(_serialize_visible_card(card_ent, card_info, location))
     
     return card_data
 
@@ -599,14 +627,16 @@ def _serialize_players_and_distribute_cards(all_cards: dict) -> dict:
 
     for player_ent, player in esper.get_component(Player):
         player_id_str = str(player.player_id)
+        graveyard_cards = esper.component_for_entity(player_ent, Graveyard).card_ids if esper.has_component(player_ent, Graveyard) else []
         players_data[player_id_str] = {
             "entity_id": player_ent,
             "health": player.health,
-            "mana_pool": player.mana_pool,
+            "mana_pool": dataclasses.asdict(player.mana_pool),
             "hand": [card_id for card_id, data in all_cards.items() if data["owner_id"] == player.player_id and data["location"] == "HAND"],
             "board": [card_id for card_id, data in all_cards.items() if data["owner_id"] == player.player_id and data["location"] == "BOARD"],
             "deck_size": len(esper.component_for_entity(player_ent, Deck).card_ids) if esper.has_component(player_ent, Deck) else 0,
-            "graveyard_size": len(esper.component_for_entity(player_ent, Graveyard).card_ids) if esper.has_component(player_ent, Graveyard) else 0,
+            "graveyard_size": len(graveyard_cards),
+            "graveyard_top_card_id": graveyard_cards[-1] if graveyard_cards else None,
             "is_connected": not esper.has_component(player_ent, Disconnected)
         }
         # NEW: Add mulligan state info

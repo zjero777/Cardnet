@@ -14,7 +14,7 @@
             "cwd": "${workspaceFolder}"
         },
         {
-            "name": "Python: Запустить Клиент 1",
+            "name": "Python: Запустить Клиент (ручной запуск)",
             "type": "debugpy",
             "request": "launch",
             "module": "src.client.main",
@@ -23,13 +23,29 @@
             "cwd": "${workspaceFolder}"
         },
         {
-            "name": "Python: Запустить Клиент 2",
+            "name": "Python: Запустить Клиент 1 (авто)",
             "type": "debugpy",
             "request": "launch",
             "module": "src.client.main",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "cwd": "${workspaceFolder}"
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--auto"
+            ]
+        }
+        ,
+        {
+            "name": "Python: Запустить Клиент 2 (авто)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.client.main",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--auto"
+            ]
         }
         ,
         {
@@ -55,11 +71,11 @@
     ],
     "compounds": [
         {
-            "name": "Сервер и 2 Клиента",
+            "name": "Сервер и 2 Клиента (авто)",
             "configurations": [
                 "Python: Запустить Сервер",
-                "Python: Запустить Клиент 1",
-                "Python: Запустить Клиент 2"
+                "Python: Запустить Клиент 1 (авто)",
+                "Python: Запустить Клиент 2 (авто)"
             ]
         }
     ]

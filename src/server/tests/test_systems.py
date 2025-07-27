@@ -3,7 +3,7 @@ import esper
 
 # Импортируем все необходимые компоненты и системы
 from src.common.components import (
-    Player, CardInfo, Owner, InHand, OnBoard, ActiveTurn, Tapped, SummoningSickness, Attacking, Deck, InDeck, Graveyard,
+    Player, CardInfo, Owner, InHand, OnBoard, ActiveTurn, Tapped, SummoningSickness, Attacking, Deck, InDeck, Graveyard, ManaPool,
     InGraveyard, PlayCardCommand, DeclareAttackersCommand, EndTurnCommand, DeclareBlockersCommand, SpellEffect, TapLandCommand,
     MulliganCommand, KeepHandCommand, MulliganDecisionPhase, KeptHand, MulliganCount, GamePhaseComponent, PutCardsBottomCommand,
     Disconnected
@@ -22,8 +22,8 @@ class SystemsTestBase(unittest.TestCase):
         self.event_queue = []
 
         # Создаем игроков
-        self.player1_id = esper.create_entity(Player(player_id=1, health=30, mana_pool=10), Graveyard())
-        self.player2_id = esper.create_entity(Player(player_id=2, health=30, mana_pool=10), Graveyard())
+        self.player1_id = esper.create_entity(Player(player_id=1, health=30), Graveyard())
+        self.player2_id = esper.create_entity(Player(player_id=2, health=30), Graveyard())
 
         # Добавляем системы в мир
         # Порядок важен, чтобы команды обрабатывались корректно
@@ -46,9 +46,10 @@ class TestPlayCardSystem(SystemsTestBase):
     def test_play_minion_card_success(self):
         """Проверяет успешный розыгрыш существа."""
         # Подготовка: даем ход игроку 1 и карту в руку
-        esper.add_component(self.player1_id, ActiveTurn()) #
-        card_id = esper.create_entity( #
-            CardInfo(name="Goblin", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
+        esper.add_component(self.player1_id, ActiveTurn())
+        esper.component_for_entity(self.player1_id, Player).mana_pool = ManaPool(R=1)
+        card_id = esper.create_entity(
+            CardInfo(name="Goblin", cost={'R': 1}, attack=1, health=1, max_health=1, card_type="MINION"),
             Owner(player_entity_id=self.player1_id),
             InHand()
         )
@@ -61,8 +62,8 @@ class TestPlayCardSystem(SystemsTestBase):
         esper.process()  # Запускаем обработку систем
 
         # Проверки:
-        player1_mana_pool = esper.component_for_entity(self.player1_id, Player).mana_pool
-        self.assertEqual(player1_mana_pool, 9, "Мана должна была потратиться")
+        player1_mana = esper.component_for_entity(self.player1_id, Player).mana_pool
+        self.assertEqual(player1_mana.R, 0, "Красная мана должна была потратиться")
         self.assertFalse(esper.has_component(card_id, InHand), "Карта должна уйти из руки")
         self.assertTrue(esper.has_component(card_id, OnBoard), "Карта должна появиться на столе")
         self.assertTrue(esper.has_component(card_id, SummoningSickness), "Существо не может атаковать в ход призыва")
@@ -75,18 +76,18 @@ class TestPlayCardSystem(SystemsTestBase):
 
     def test_play_card_not_enough_mana(self):
         """Проверяет, что нельзя разыграть карту при нехватке маны."""
-        esper.component_for_entity(self.player1_id, Player).mana_pool = 3
+        esper.component_for_entity(self.player1_id, Player).mana_pool = ManaPool(W=1, generic=1)
         esper.add_component(self.player1_id, ActiveTurn())
-        card_id = esper.create_entity( #
-            CardInfo(name="Expensive", cost=5, attack=5, health=5, max_health=5, card_type="MINION"),
+        card_id = esper.create_entity(
+            CardInfo(name="Expensive", cost={'R': 1, 'generic': 2}, attack=5, health=5, max_health=5, card_type="MINION"),
             Owner(player_entity_id=self.player1_id),
             InHand()
         )
 
         esper.create_entity(PlayCardCommand(player_entity_id=self.player1_id, card_entity_id=card_id))
         esper.process()
-
-        self.assertEqual(esper.component_for_entity(self.player1_id, Player).mana_pool, 3, "Мана не должна была измениться")
+        
+        self.assertEqual(esper.component_for_entity(self.player1_id, Player).mana_pool.W, 1, "Мана не должна была измениться")
         self.assertTrue(esper.has_component(card_id, InHand), "Карта должна остаться в руке")
         self.assertIn("Недостаточно маны", str(self.event_queue), "Должно быть сообщение об ошибке")
 
@@ -95,10 +96,10 @@ class TestPlayCardSystem(SystemsTestBase):
         # Подготовка
         esper.add_component(self.player1_id, ActiveTurn())
         player1 = esper.component_for_entity(self.player1_id, Player)
-        player1.mana_pool = 5
+        player1.mana_pool = ManaPool(R=2, C=2)
 
         spell_card_id = esper.create_entity(
-            CardInfo(name="Fireball", cost=4, card_type="SPELL"),
+            CardInfo(name="Fireball", cost={'R': 1, 'generic': 3}, card_type="SPELL"),
             Owner(player_entity_id=self.player1_id),
             InHand(),
             SpellEffect(effect_type="DEAL_DAMAGE", value=6, requires_target=True)
@@ -113,7 +114,8 @@ class TestPlayCardSystem(SystemsTestBase):
         esper.process()
 
         # Проверки
-        self.assertEqual(esper.component_for_entity(self.player1_id, Player).mana_pool, 1, "Мана должна была потратиться")
+        player1_mana = esper.component_for_entity(self.player1_id, Player).mana_pool
+        self.assertEqual(player1_mana.R, 1, "Должна остаться одна красная мана")
         self.assertEqual(esper.component_for_entity(self.player2_id, Player).health, 24, "Здоровье оппонента должно было уменьшиться")
         self.assertTrue(esper.has_component(spell_card_id, InGraveyard), "Карта заклинания должна быть на кладбище")
         player1_graveyard = esper.component_for_entity(self.player1_id, Graveyard)
@@ -129,8 +131,8 @@ class TestAttackSystem(SystemsTestBase):
         """Проверяет объявление атакующего существа."""
         # Подготовка: ход игрока 1, у него на столе есть существо без "усталости от призыва"
         esper.add_component(self.player1_id, ActiveTurn())
-        attacker_id = esper.create_entity( #
-            CardInfo(name="Knight", cost=3, attack=3, health=3, max_health=3, card_type="MINION"),
+        attacker_id = esper.create_entity(
+            CardInfo(name="Knight", cost={'W': 2}, attack=3, health=3, max_health=3, card_type="MINION"),
             Owner(player_entity_id=self.player1_id),
             OnBoard()  # Уже на столе, может атаковать
         )
@@ -157,8 +159,8 @@ class TestAttackSystem(SystemsTestBase):
         # 1. Игрок 1 - активный
         esper.add_component(self.player1_id, ActiveTurn())
         # 2. У игрока 1 есть существо на столе
-        attacker_id = esper.create_entity( #
-            CardInfo(name="Knight", cost=3, attack=3, health=3, max_health=3, card_type="MINION"),
+        attacker_id = esper.create_entity(
+            CardInfo(name="Knight", cost={'W': 2}, attack=3, health=3, max_health=3, card_type="MINION"),
             Owner(player_entity_id=self.player1_id),
             OnBoard()
         )
@@ -187,12 +189,12 @@ class TestAttackSystem(SystemsTestBase):
         """Проверяет бой, в котором оба существа выживают."""
         # Подготовка
         esper.add_component(self.player1_id, ActiveTurn())
-        attacker_id = esper.create_entity( #
-            CardInfo(name="Attacker", cost=2, attack=2, health=4, max_health=4, card_type="MINION"),
+        attacker_id = esper.create_entity(
+            CardInfo(name="Attacker", cost={'R': 2}, attack=2, health=4, max_health=4, card_type="MINION"),
             Owner(player_entity_id=self.player1_id), OnBoard()
         )
-        blocker_id = esper.create_entity( #
-            CardInfo(name="Blocker", cost=1, attack=1, health=3, max_health=3, card_type="MINION"),
+        blocker_id = esper.create_entity(
+            CardInfo(name="Blocker", cost={'W': 1}, attack=1, health=3, max_health=3, card_type="MINION"),
             Owner(player_entity_id=self.player2_id), OnBoard()
         )
         # Действие 1: Объявляем атакующих
@@ -225,12 +227,12 @@ class TestAttackSystem(SystemsTestBase):
         """Проверяет бой, в котором блокер погибает."""
         # Подготовка
         esper.add_component(self.player1_id, ActiveTurn())
-        attacker_id = esper.create_entity( #
-            CardInfo(name="Attacker", cost=3, attack=3, health=3, max_health=3, card_type="MINION"),
+        attacker_id = esper.create_entity(
+            CardInfo(name="Attacker", cost={'R': 3}, attack=3, health=3, max_health=3, card_type="MINION"),
             Owner(player_entity_id=self.player1_id), OnBoard()
         )
-        blocker_id = esper.create_entity( #
-            CardInfo(name="Blocker", cost=1, attack=1, health=2, max_health=2, card_type="MINION"),
+        blocker_id = esper.create_entity(
+            CardInfo(name="Blocker", cost={'W': 1}, attack=1, health=2, max_health=2, card_type="MINION"),
             Owner(player_entity_id=self.player2_id), OnBoard()
         )
         # Действие 1: Объявляем атакующих
@@ -259,9 +261,9 @@ class TestTapLandSystem(SystemsTestBase):
         # Подготовка
         esper.add_component(self.player1_id, ActiveTurn())
         player1 = esper.component_for_entity(self.player1_id, Player)
-        player1.mana_pool = 0
+        player1.mana_pool = ManaPool()
         land_id = esper.create_entity(
-            CardInfo(name="Plains", cost=0, card_type="LAND"),
+            CardInfo(name="Plains", cost={}, card_type="LAND", produces="W"),
             Owner(player_entity_id=self.player1_id),
             OnBoard()
         )
@@ -271,7 +273,7 @@ class TestTapLandSystem(SystemsTestBase):
         esper.process()
 
         # Проверки
-        self.assertEqual(esper.component_for_entity(self.player1_id, Player).mana_pool, 1, "Пул маны должен увеличиться на 1")
+        self.assertEqual(esper.component_for_entity(self.player1_id, Player).mana_pool.W, 1, "Пул белой маны должен увеличиться на 1")
         self.assertTrue(esper.has_component(land_id, Tapped), "Земля должна быть повернута")
 
 
@@ -284,16 +286,16 @@ class TestTurnManagementSystem(SystemsTestBase):
         esper.add_component(self.player1_id, ActiveTurn())
         # Даем игроку 2 существо с болезнью вызова и повернутую землю
         esper.create_entity(
-            CardInfo(name="Tapped Land", cost=0, card_type="LAND"),
+            CardInfo(name="Tapped Land", cost={}, card_type="LAND"),
             Owner(player_entity_id=self.player2_id), OnBoard(), Tapped()
         )
         esper.create_entity(
-            CardInfo(name="Sick Minion", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
+            CardInfo(name="Sick Minion", cost={'R': 1}, attack=1, health=1, max_health=1, card_type="MINION"),
             Owner(player_entity_id=self.player2_id), OnBoard(), SummoningSickness()
         )
         # Даем игроку 2 карту в колоду для взятия
-        card_in_deck = esper.create_entity( #
-            CardInfo(name="Test Card", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
+        card_in_deck = esper.create_entity(
+            CardInfo(name="Test Card", cost={'R': 1}, attack=1, health=1, max_health=1, card_type="MINION"),
             Owner(self.player2_id),
             InDeck()
         )
@@ -320,13 +322,13 @@ class TestTurnManagementSystem(SystemsTestBase):
         esper.add_component(self.player1_id, ActiveTurn())
         # Создаем существо с неполным здоровьем
         damaged_minion_id = esper.create_entity(
-            CardInfo(name="Damaged Knight", cost=3, attack=3, health=1, max_health=3, card_type="MINION"),
+            CardInfo(name="Damaged Knight", cost={'W': 2}, attack=3, health=1, max_health=3, card_type="MINION"),
             Owner(player_entity_id=self.player1_id),
             OnBoard()
         )
         # Создаем существо оппонента, которое не должно лечиться
         opponent_minion_id = esper.create_entity(
-            CardInfo(name="Opponent's Minion", cost=1, attack=1, health=1, max_health=2, card_type="MINION"),
+            CardInfo(name="Opponent's Minion", cost={'R': 1}, attack=1, health=1, max_health=2, card_type="MINION"),
             Owner(player_entity_id=self.player2_id),
             OnBoard()
         )
@@ -366,15 +368,15 @@ class TestGameFlow(unittest.TestCase):
         # Создаем карты и добавляем их ID в колоды
         p1_deck_ids = []
         for i in range(40):
-            card_id = esper.create_entity( #
-                CardInfo(name=f"P1 Card {i}", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
+            card_id = esper.create_entity(
+                CardInfo(name=f"P1 Card {i}", cost={'R': 1}, attack=1, health=1, max_health=1, card_type="MINION"),
                 Owner(self.player1_id), InDeck()
             )
             p1_deck_ids.append(card_id)
         p2_deck_ids = []
         for i in range(40):
-            card_id = esper.create_entity( #
-                CardInfo(name=f"P2 Card {i}", cost=1, attack=1, health=1, max_health=1, card_type="MINION"),
+            card_id = esper.create_entity(
+                CardInfo(name=f"P2 Card {i}", cost={'W': 1}, attack=1, health=1, max_health=1, card_type="MINION"),
                 Owner(self.player2_id), InDeck()
             )
             p2_deck_ids.append(card_id)

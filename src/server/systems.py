@@ -1,19 +1,33 @@
 import esper
 import time
 import random
+from typing import Dict
 from src.common.components import (
     PlayCardCommand, Player, CardInfo, InHand, OnBoard, Owner, ActiveTurn, EndTurnCommand,
     Deck, InDeck, GameOver, SpellEffect, Tapped, TapLandCommand, PlayedLandThisTurn, SummoningSickness,
-    Attacking, WaitingForBlockers, DeclareBlockersCommand, DeclareAttackersCommand,
+    Attacking, WaitingForBlockers, DeclareBlockersCommand, DeclareAttackersCommand, ManaPool,
     Graveyard, InGraveyard, KeptHand, Disconnected,
     MulliganCommand, KeepHandCommand, PutCardsBottomCommand, MulliganDecisionPhase,
     MulliganCount, GamePhaseComponent
 )
 
 def _move_to_graveyard(card_ent, event_queue):
-    """Перемещает карту на кладбище ее владельца."""
+    """Перемещает карту на кладбище ее владельца, сбрасывая ее состояние."""
     if not esper.entity_exists(card_ent): return
     try:
+        # --- Сброс состояния карты ---
+        if esper.has_component(card_ent, Tapped):
+            esper.remove_component(card_ent, Tapped)
+        if esper.has_component(card_ent, Attacking):
+            esper.remove_component(card_ent, Attacking)
+        if esper.has_component(card_ent, SummoningSickness):
+            esper.remove_component(card_ent, SummoningSickness)
+
+        card_info = esper.component_for_entity(card_ent, CardInfo)
+        if card_info.card_type == "MINION" and card_info.max_health is not None:
+            card_info.health = card_info.max_health
+
+        # --- Перемещение на кладбище ---
         owner = esper.component_for_entity(card_ent, Owner)
         player_ent = owner.player_entity_id
         graveyard = esper.component_for_entity(player_ent, Graveyard)
@@ -25,11 +39,44 @@ def _move_to_graveyard(card_ent, event_queue):
             esper.remove_component(card_ent, InHand)
 
         esper.add_component(card_ent, InGraveyard())
-        event_queue.append({"type": "CARD_DIED", "payload": {"card_id": card_ent}})
+
+        # --- Сериализуем финальное состояние карты для события ---
+        card_data = {
+            "name": card_info.name,
+            "cost": card_info.cost,
+            "type": card_info.card_type,
+            "is_tapped": False,
+            "is_attacking": False,
+            "has_sickness": False,
+            "owner_id": player_ent,
+            "location": "GRAVEYARD",
+        }
+        if card_info.card_type == "LAND":
+            card_data["produces"] = card_info.produces
+            card_data["can_attack"] = False
+        elif card_info.card_type == "MINION":
+            card_data["attack"] = card_info.attack
+            card_data["health"] = card_info.health
+            card_data["max_health"] = card_info.max_health
+            card_data["can_attack"] = False
+        elif card_info.card_type == "SPELL" and esper.has_component(card_ent, SpellEffect):
+            effect = esper.component_for_entity(card_ent, SpellEffect)
+            card_data["effect"] = {"type": effect.effect_type, "value": effect.value, "requires_target": effect.requires_target}
+            card_data["can_attack"] = False
+        else:
+            card_data["can_attack"] = False
+
+        event_queue.append({
+            "type": "CARD_DIED",
+            "payload": {
+                "card_id": card_ent,
+                "owner_id": player_ent,
+                "card_data": card_data
+            }
+        })
     except KeyError:
         print(f"Could not move card {card_ent} to graveyard, deleting instead.")
         esper.delete_entity(card_ent, immediate=True)
-        event_queue.append({"type": "CARD_DIED", "payload": {"card_id": card_ent}})
 
 class PlayCardSystem(esper.Processor):
     """Система, отвечающая за логику розыгрыша карт."""
@@ -37,6 +84,43 @@ class PlayCardSystem(esper.Processor):
     def __init__(self, event_queue):
         super().__init__()
         self.event_queue = event_queue
+
+    def _can_pay_cost(self, mana_pool: ManaPool, cost: Dict[str, int]) -> bool:
+        """Проверяет, достаточно ли маны в пуле для оплаты стоимости."""
+        # Создаем копию, чтобы не изменять оригинальный пул
+        available_mana = mana_pool.__dict__.copy()
+
+        # Проверяем наличие специфической цветной маны
+        for color, amount in cost.items():
+            if color == 'generic':
+                continue
+            # Убеждаемся, что цвет валидный (W, U, B, R, G, C)
+            if color.upper() not in "WUBRGC": continue
+            if available_mana.get(color.upper(), 0) < amount:
+                return False
+            available_mana[color.upper()] -= amount
+
+        # Проверяем, хватает ли оставшейся маны на общую стоимость
+        remaining_generic_cost = cost.get('generic', 0)
+        total_remaining_mana = sum(available_mana.values())
+
+        return total_remaining_mana >= remaining_generic_cost
+
+    def _spend_mana(self, player: Player, cost: Dict[str, int]):
+        """Тратит ману из пула игрока для оплаты стоимости."""
+        # Сначала тратим цветную ману
+        for color, amount in cost.items():
+            if color == 'generic' or color.upper() not in "WUBRGC": continue
+            current_mana = getattr(player.mana_pool, color.upper())
+            setattr(player.mana_pool, color.upper(), current_mana - amount)
+
+        # Затем тратим ману на общую стоимость, предпочитая бесцветную
+        generic_cost = cost.get('generic', 0)
+        for color_char in "CWUBRG": # C (Colorless) first
+            if generic_cost <= 0: break
+            can_spend = min(generic_cost, getattr(player.mana_pool, color_char))
+            setattr(player.mana_pool, color_char, getattr(player.mana_pool, color_char) - can_spend)
+            generic_cost -= can_spend
 
     def _send_error(self, player_id, message):
         self.event_queue.append({"type": "ACTION_ERROR", "payload": {"player_id": player_id, "message": message}})
@@ -62,11 +146,11 @@ class PlayCardSystem(esper.Processor):
     def _play_minion(self, player, command, card_info):
         """Логика розыгрыша существа."""
         print(f"Player {command.player_entity_id} plays minion {card_info.name}!")
-        # 1. Списываем ману 
-        player.mana_pool -= card_info.cost
+        # 1. Списываем ману
+        self._spend_mana(player, card_info.cost)
         self.event_queue.append({
             "type": "PLAYER_MANA_POOL_UPDATED",
-            "payload": {"player_id": command.player_entity_id, "new_mana_pool": player.mana_pool}
+            "payload": {"player_id": command.player_entity_id, "new_mana_pool": player.mana_pool.__dict__}
         })
         # 2. Перемещаем на стол
         esper.remove_component(command.card_entity_id, InHand)
@@ -91,10 +175,10 @@ class PlayCardSystem(esper.Processor):
             return
 
         # Списываем ману
-        player.mana_pool -= card_info.cost
+        self._spend_mana(player, card_info.cost)
         self.event_queue.append({
             "type": "PLAYER_MANA_POOL_UPDATED",
-            "payload": {"player_id": command.player_entity_id, "new_mana_pool": player.mana_pool}
+            "payload": {"player_id": command.player_entity_id, "new_mana_pool": player.mana_pool.__dict__}
         })
 
         # Применяем эффект
@@ -103,7 +187,7 @@ class PlayCardSystem(esper.Processor):
             if not esper.entity_exists(target_ent):
                 self._send_error(command.player_entity_id, "Цель не существует.")
                 # Возвращаем ману, т.к. действие не удалось
-                player.mana_pool += card_info.cost
+                # TODO: Implement mana refund logic if needed
                 return
 
             # Наносим урон игроку
@@ -129,7 +213,7 @@ class PlayCardSystem(esper.Processor):
                     _move_to_graveyard(target_ent, self.event_queue)
             else:
                 self._send_error(command.player_entity_id, "Неверный тип цели для урона.")
-                player.mana_pool += card_info.cost # Возврат маны
+                # TODO: Implement mana refund logic if needed
                 return
 
         # Перемещаем заклинание на кладбище после использования
@@ -157,8 +241,8 @@ class PlayCardSystem(esper.Processor):
                     continue
                 
                 # Земли бесплатны, для остальных проверяем ману
-                if card_info.card_type != "LAND" and player.mana_pool < card_info.cost:
-                    self._send_error(command.player_entity_id, f"Недостаточно маны. Нужно {card_info.cost}, у вас {player.mana_pool}.")
+                if card_info.card_type != "LAND" and not self._can_pay_cost(player.mana_pool, card_info.cost):
+                    self._send_error(command.player_entity_id, f"Недостаточно маны для розыгрыша '{card_info.name}'.")
                     continue
 
                 # --- Разделение логики по типу карты ---
@@ -246,12 +330,12 @@ class TurnManagementSystem(esper.Processor):
             esper.remove_component(next_player_ent, PlayedLandThisTurn)
 
         # 3. Очищаем пул маны
-        next_player_component.mana_pool = 0
+        next_player_component.mana_pool = ManaPool()
 
         self.event_queue.append({"type": "TURN_STARTED", "payload": {"player_id": next_player_ent}})
         self.event_queue.append({
             "type": "PLAYER_MANA_POOL_UPDATED",
-            "payload": {"player_id": next_player_ent, "new_mana_pool": 0}
+            "payload": {"player_id": next_player_ent, "new_mana_pool": ManaPool().__dict__}
         })
 
         # Логика взятия карты
@@ -261,9 +345,37 @@ class TurnManagementSystem(esper.Processor):
                 card_to_draw_id = player_deck.card_ids.pop(0) # Берем верхнюю карту
                 esper.remove_component(card_to_draw_id, InDeck)
                 esper.add_component(card_to_draw_id, InHand())
+
+                # NEW: Serialize card data to send with the event
+                card_info = esper.component_for_entity(card_to_draw_id, CardInfo)
+                card_data = {
+                    "name": card_info.name,
+                    "cost": card_info.cost,
+                    "type": card_info.card_type,
+                    "is_tapped": False,
+                    "is_attacking": False,
+                    "has_sickness": False,
+                    "owner_id": next_player_ent,
+                    "location": "HAND",
+                }
+                if card_info.card_type == "LAND":
+                    card_data["produces"] = card_info.produces
+                    card_data["can_attack"] = False
+                elif card_info.card_type == "MINION":
+                    card_data["attack"] = card_info.attack
+                    card_data["health"] = card_info.health
+                    card_data["max_health"] = card_info.max_health
+                    card_data["can_attack"] = False
+                elif card_info.card_type == "SPELL" and esper.has_component(card_to_draw_id, SpellEffect):
+                    effect = esper.component_for_entity(card_to_draw_id, SpellEffect)
+                    card_data["effect"] = {"type": effect.effect_type, "value": effect.value, "requires_target": effect.requires_target}
+                    card_data["can_attack"] = False
+                else:
+                    card_data["can_attack"] = False
+
                 self.event_queue.append({
                     "type": "CARD_DRAWN",
-                    "payload": {"player_id": next_player_ent, "card_id": card_to_draw_id}
+                    "payload": {"player_id": next_player_ent, "card_id": card_to_draw_id, "card_data": card_data}
                 })
                 print(f"Player {next_player_ent} draws a card.")
             else:
@@ -274,33 +386,25 @@ class TurnManagementSystem(esper.Processor):
 
 class GameOverSystem(esper.Processor):
     """Система для проверки условия конца игры и объявления победителя."""
-    RESET_DELAY = 5.0  # 5 секунд до сброса
 
-    def __init__(self, event_queue, reset_callback):
+    def __init__(self, event_queue):
         super().__init__()
         self.event_queue = event_queue
-        self.reset_callback = reset_callback
         self.game_is_over = False
-        self.game_over_time = None
+
+    def reset(self):
+        """Сбрасывает состояние системы для новой игры."""
+        self.game_is_over = False
 
     def process(self):
-        # 1. Если игра окончена, проверяем, не пора ли ее сбросить
-        if self.game_is_over and self.game_over_time:
-            if time.monotonic() - self.game_over_time > self.RESET_DELAY:
-                print("--- Resetting game state after delay ---")
-                self.reset_callback()
-                self.game_is_over = False
-                self.game_over_time = None
-            return  # Ничего не делаем, пока ждем сброса
-
-        # 2. Если игра уже помечена как завершенная (но таймер еще не запущен), выходим
+        # Если игра уже помечена как завершенная, выходим.
+        # Сброс будет инициирован клиентом.
         if self.game_is_over:
             return
 
-        # 3. Ищем компонент-маркер GameOver, чтобы запустить процесс завершения игры
+        # Ищем компонент-маркер GameOver, чтобы запустить процесс завершения игры
         for _, game_over in esper.get_component(GameOver):
             self.game_is_over = True
-            self.game_over_time = time.monotonic()  # Запускаем таймер сброса
             winner_id = game_over.winner_player_id
             # Простая логика определения проигравшего для 2 игроков
             all_players = [ent for ent, _ in esper.get_component(Player)]
@@ -364,89 +468,98 @@ class AttackSystem(esper.Processor):
     def _resolve_combat(self, command: DeclareBlockersCommand):
         """Обрабатывает блоки и рассчитывает урон."""
         declarer_ent = command.player_entity_id
-        if not esper.has_component(declarer_ent, WaitingForBlockers):
-            self._send_error(declarer_ent, "Сейчас не ваша фаза блокирования.")
-            return
-
-        # The player who declared blockers is the defender. The active player is the attacker.
         active_player_ent = next((ent for ent, _ in esper.get_component(ActiveTurn)), None)
-        if not active_player_ent:
-            return
+        try:
+            if not esper.has_component(declarer_ent, WaitingForBlockers):
+                self._send_error(declarer_ent, "Сейчас не ваша фаза блокирования.")
+                return
 
-        esper.remove_component(declarer_ent, WaitingForBlockers)
+            if not active_player_ent:
+                return # Should not happen if WaitingForBlockers is present
 
-        # Собираем информацию о всех атакующих и их блокерах
-        combat_map = {ent: [] for ent, _ in esper.get_components(Attacking)}
+            esper.remove_component(declarer_ent, WaitingForBlockers)
 
-        for blocker_id, attacker_id in command.blocks.items():
-            try:
-                # Валидация блока
-                if attacker_id not in combat_map:
-                    self._send_error(declarer_ent, f"Существо {attacker_id} не атакует.")
-                    continue
-                blocker_owner = esper.component_for_entity(blocker_id, Owner)
-                if blocker_owner.player_entity_id != declarer_ent:
-                    self._send_error(declarer_ent, f"Существо {blocker_id} не ваше.")
-                    continue
-                if esper.has_component(blocker_id, Tapped):
-                    self._send_error(declarer_ent, f"Существо {blocker_id} повернуто.")
-                    continue
+            # Собираем информацию о всех атакующих и их блокерах
+            combat_map = {ent: [] for ent, _ in esper.get_components(Attacking)}
 
-                # Блок валиден, поворачиваем блокера
-                esper.add_component(blocker_id, Tapped())
-                combat_map[attacker_id].append(blocker_id)
-            except KeyError:
-                self._send_error(declarer_ent, "Ошибка при назначении блокера.")
+            for blocker_id, attacker_id in command.blocks.items():
+                try:
+                    # Валидация блока
+                    if attacker_id not in combat_map:
+                        self._send_error(declarer_ent, f"Существо {attacker_id} не атакует.")
+                        continue
+                    blocker_owner = esper.component_for_entity(blocker_id, Owner)
+                    if blocker_owner.player_entity_id != declarer_ent:
+                        self._send_error(declarer_ent, f"Существо {blocker_id} не ваше.")
+                        continue
+                    if esper.has_component(blocker_id, Tapped):
+                        self._send_error(declarer_ent, f"Существо {blocker_id} повернуто.")
+                        continue
 
-        # Расчет урона
-        defender_player_comp = esper.component_for_entity(declarer_ent, Player)
+                    # Блок валиден, поворачиваем блокера
+                    esper.add_component(blocker_id, Tapped())
+                    combat_map[attacker_id].append(blocker_id)
+                except KeyError:
+                    self._send_error(declarer_ent, "Ошибка при назначении блокера.")
 
-        for attacker_ent, blocker_ents in combat_map.items():
-            if not esper.entity_exists(attacker_ent): continue
-            attacker_info = esper.component_for_entity(attacker_ent, CardInfo)
+            # Расчет урона
+            defender_player_comp = esper.component_for_entity(declarer_ent, Player)
 
-            if not blocker_ents:
-                # Атака прошла без блока
-                print(f"Attacker {attacker_ent} is unblocked, dealing {attacker_info.attack} damage to player {declarer_ent}")
-                defender_player_comp.health -= attacker_info.attack
-                self.event_queue.append({
-                    "type": "PLAYER_DAMAGED",
-                    "payload": {"player_id": declarer_ent, "new_health": defender_player_comp.health, "attacker_id": attacker_ent}
-                })
-            else:
-                # Атака заблокирована
-                # TODO: Обработать урон от нескольких блокеров. Пока считаем, что блокер один.
-                blocker_ent = blocker_ents[0]
-                if not esper.entity_exists(blocker_ent): continue
+            for attacker_ent, blocker_ents in combat_map.items():
+                if not esper.entity_exists(attacker_ent): continue
+                attacker_info = esper.component_for_entity(attacker_ent, CardInfo)
 
-                blocker_info = esper.component_for_entity(blocker_ent, CardInfo)
-                print(f"Attacker {attacker_ent} ({attacker_info.attack}/{attacker_info.health}) blocked by {blocker_ent} ({blocker_info.attack}/{blocker_info.health})")
+                if not blocker_ents:
+                    # Атака прошла без блока
+                    print(f"Attacker {attacker_ent} is unblocked, dealing {attacker_info.attack} damage to player {declarer_ent}")
+                    defender_player_comp.health -= attacker_info.attack
+                    self.event_queue.append({
+                        "type": "PLAYER_DAMAGED",
+                        "payload": {"player_id": declarer_ent, "new_health": defender_player_comp.health, "attacker_id": attacker_ent}
+                    })
+                else:
+                    # Атака заблокирована
+                    # TODO: Обработать урон от нескольких блокеров. Пока считаем, что блокер один.
+                    blocker_ent = blocker_ents[0]
+                    if not esper.entity_exists(blocker_ent): continue
 
-                blocker_info.health -= attacker_info.attack
-                attacker_info.health -= blocker_info.attack
-                self.event_queue.append({
-                    "type": "CARD_ATTACKED",
-                    "payload": {
-                        "attacker_id": attacker_ent, "target_id": blocker_ent,
-                        "attacker_new_health": attacker_info.health, "target_new_health": blocker_info.health
-                    }})
+                    blocker_info = esper.component_for_entity(blocker_ent, CardInfo)
+                    print(f"Attacker {attacker_ent} ({attacker_info.attack}/{attacker_info.health}) blocked by {blocker_ent} ({blocker_info.attack}/{blocker_info.health})")
 
-                if esper.entity_exists(blocker_ent) and blocker_info.health <= 0:
-                    _move_to_graveyard(blocker_ent, self.event_queue)
+                    blocker_info.health -= attacker_info.attack
+                    attacker_info.health -= blocker_info.attack
+                    self.event_queue.append({
+                        "type": "CARD_ATTACKED",
+                        "payload": {
+                            "attacker_id": attacker_ent, "target_id": blocker_ent,
+                            "attacker_new_health": attacker_info.health, "target_new_health": blocker_info.health
+                        }})
 
-            if esper.entity_exists(attacker_ent) and attacker_info.health <= 0:
-                _move_to_graveyard(attacker_ent, self.event_queue)
+                    if esper.entity_exists(blocker_ent) and blocker_info.health <= 0:
+                        _move_to_graveyard(blocker_ent, self.event_queue)
 
-        # Очистка состояния боя
-        for attacker_ent in combat_map:
-            if esper.entity_exists(attacker_ent):
-                esper.remove_component(attacker_ent, Attacking)
+                if esper.entity_exists(attacker_ent) and attacker_info.health <= 0:
+                    _move_to_graveyard(attacker_ent, self.event_queue)
 
-        self.event_queue.append({"type": "COMBAT_RESOLVED"})
+            # Проверка на конец игры
+            if defender_player_comp.health <= 0 and not esper.get_component(GameOver):
+                esper.create_entity(GameOver(winner_player_id=active_player_ent))
+        except KeyError as e:
+            # Логируем ошибку, чтобы ее можно было отследить
+            import logging
+            logging.exception(f"KeyError during combat resolution: {e}")
+            self._send_error(declarer_ent, "Критическая ошибка при расчете боя.")
+        finally:
+            # Этот блок выполнится всегда, даже если произошла ошибка.
+            # Это гарантирует, что состояние боя будет очищено и игра сможет продолжиться.
+            for attacker_ent, _ in list(esper.get_components(Attacking)):
+                if esper.entity_exists(attacker_ent):
+                    esper.remove_component(attacker_ent, Attacking)
 
-        # Проверка на конец игры
-        if defender_player_comp.health <= 0 and not esper.get_component(GameOver):
-            esper.create_entity(GameOver(winner_player_id=active_player_ent))
+            if esper.has_component(declarer_ent, WaitingForBlockers):
+                esper.remove_component(declarer_ent, WaitingForBlockers)
+
+            self.event_queue.append({"type": "COMBAT_RESOLVED"})
 
     def process(self):
         # 1. Обработка объявления атакующих
@@ -461,13 +574,10 @@ class AttackSystem(esper.Processor):
 
         # 2. Обработка объявления блокеров
         for cmd_ent, command in list(esper.get_component(DeclareBlockersCommand)):
-            try:
-                self._resolve_combat(command)
-            except KeyError as e:
-                print(f"Error processing declare blockers command: {e}")
-                self._send_error(command.player_entity_id, "Ошибка при обработке блокеров.")
-            finally:
-                esper.delete_entity(cmd_ent, immediate=True)
+            # Вся логика, включая обработку ошибок, теперь внутри _resolve_combat,
+            # чтобы гарантировать отправку события COMBAT_RESOLVED.
+            self._resolve_combat(command)
+            esper.delete_entity(cmd_ent, immediate=True)
 
 
 class TapLandSystem(esper.Processor):
@@ -499,13 +609,18 @@ class TapLandSystem(esper.Processor):
                     continue
 
                 # Все проверки пройдены, поворачиваем для получения маны
+                mana_type = card_info.produces
+                if not mana_type or mana_type.upper() not in "WUBRGC":
+                    self._send_error(player_ent, "Эта земля не производит ману.")
+                    continue
+
                 player = esper.component_for_entity(player_ent, Player)
-                player.mana_pool += 1  # Базовые земли дают 1 ману
+                setattr(player.mana_pool, mana_type.upper(), getattr(player.mana_pool, mana_type.upper()) + 1)
                 esper.add_component(card_ent, Tapped())
 
                 self.event_queue.append({
                     "type": "PLAYER_MANA_POOL_UPDATED",
-                    "payload": {"player_id": player_ent, "new_mana_pool": player.mana_pool}
+                    "payload": {"player_id": player_ent, "new_mana_pool": player.mana_pool.__dict__}
                 })
             except KeyError:
                 self._send_error(player_ent, "Ошибка: сущность или компонент не найден.")
@@ -534,6 +649,8 @@ class MulliganSystem(esper.Processor):
         starting_player_ent = random.choice(all_players) if all_players else 1
 
         esper.add_component(starting_player_ent, ActiveTurn())
+        # Отправляем событие о начале игры, чтобы клиент мог сменить свой основной статус
+        self.event_queue.append({"type": "GAME_STARTED"})
         self.event_queue.append({"type": "TURN_STARTED", "payload": {"player_id": starting_player_ent}})
         print("--- Mulligan phase complete. Starting game. ---")
 
